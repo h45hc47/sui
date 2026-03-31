@@ -1,4 +1,7 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use crate::{
     errors::PackageResult,
@@ -8,8 +11,9 @@ use crate::{
 };
 
 /// A Builder for the [RootPackage] type
-pub struct PackageLoader {
+pub struct PackageLoader<F: MoveFlavor> {
     config: PackageConfig,
+    flavor: Arc<F>,
 }
 
 #[derive(Clone, Debug)]
@@ -61,11 +65,12 @@ pub enum LoadType {
     },
 }
 
-impl PackageLoader {
+impl<F: MoveFlavor> PackageLoader<F> {
     /// A loader that loads the root package from `root_dir` for `env`
-    pub fn new(root_dir: impl AsRef<Path>, env: Environment) -> Self {
+    pub fn new(root_dir: impl AsRef<Path>, env: Environment, flavor: Arc<F>) -> Self {
         Self {
             config: PackageConfig::persistent(root_dir, env, vec![]),
+            flavor,
         }
     }
 
@@ -80,6 +85,7 @@ impl PackageLoader {
         build_env: Option<EnvironmentName>,
         chain_id: EnvironmentID,
         pubfile_path: impl AsRef<Path>,
+        flavor: Arc<F>,
     ) -> Self {
         let config = PackageConfig {
             input_path: root_dir.as_ref().to_path_buf(),
@@ -94,7 +100,7 @@ impl PackageLoader {
             ignore_digests: false,
             allow_dirty: false,
         };
-        Self { config }
+        Self { config, flavor }
     }
 
     /// dependencies with modes will be filtered out if those modes don't intersect with `modes`
@@ -137,13 +143,16 @@ impl PackageLoader {
     /// By default `load` attempts to load the package from the lockfile, and repins if it is
     /// missing or out-of-date. However, this behavior can be changed using [Self::ignore_digests] and
     /// [Self::force_repin]
-    pub async fn load<F: MoveFlavor>(self) -> PackageResult<RootPackage<F>> {
-        RootPackage::validate_and_construct(self.config).await
+    pub async fn load(self) -> PackageResult<RootPackage<F>> {
+        RootPackage::validate_and_construct(self.config, self.flavor).await
     }
 
     /// Block the current thread and call [Self::load]
-    pub fn load_sync<F: MoveFlavor>(self) -> PackageResult<RootPackage<F>> {
-        block_on!(RootPackage::validate_and_construct(self.config))
+    pub fn load_sync(self) -> PackageResult<RootPackage<F>> {
+        block_on!(RootPackage::validate_and_construct(
+            self.config,
+            self.flavor
+        ))
     }
 
     pub(crate) fn config(&self) -> &PackageConfig {
@@ -152,7 +161,11 @@ impl PackageLoader {
 }
 
 impl PackageConfig {
-    fn persistent(path: impl AsRef<Path>, env: Environment, modes: Vec<ModeName>) -> Self {
+    pub(crate) fn persistent(
+        path: impl AsRef<Path>,
+        env: Environment,
+        modes: Vec<ModeName>,
+    ) -> Self {
         Self {
             input_path: path.as_ref().to_path_buf(),
             chain_id: env.id,

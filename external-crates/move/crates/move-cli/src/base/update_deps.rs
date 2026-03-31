@@ -11,6 +11,7 @@ use move_package_alt::{
     schema::{Environment, EnvironmentName},
 };
 use move_package_alt_compilation::build_config::BuildConfig;
+use std::sync::Arc;
 
 /// Re-pin the dependencies of this package.
 #[derive(Debug, Clone, Parser)]
@@ -27,12 +28,13 @@ impl UpdateDeps {
         path: Option<&Path>,
         build_config: &BuildConfig,
         env: Environment,
+        flavor: Arc<F>,
     ) -> anyhow::Result<()> {
         let default = PathBuf::from(".");
         let path = path.unwrap_or(&default);
 
         let mut root_package: RootPackage<F> = build_config
-            .package_loader(path, &env)
+            .package_loader(path, &env, flavor)
             .force_repin(true)
             .load()
             .await?;

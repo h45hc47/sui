@@ -32,6 +32,7 @@ use move_package_alt_compilation::{
 };
 use move_symbol_pool::Symbol;
 
+use std::sync::Arc;
 use sui_package_alt::{SuiFlavor, testnet_environment};
 use sui_protocol_config::{Chain, ProtocolConfig, ProtocolVersion};
 use sui_types::{
@@ -181,7 +182,7 @@ impl BuildConfig {
     pub async fn build_async(self, path: &Path) -> anyhow::Result<CompiledPackage> {
         let mut root_pkg = self
             .config
-            .package_loader(path, &self.environment)
+            .package_loader(path, &self.environment, Arc::new(SuiFlavor))
             .load()
             .await?;
 
@@ -201,7 +202,7 @@ impl BuildConfig {
         // we need to block here to compile the package, which requires to fetch dependencies
         let mut root_pkg = self
             .config
-            .package_loader(path, &self.environment)
+            .package_loader(path, &self.environment, Arc::new(SuiFlavor))
             .load_sync()?;
 
         self.internal_build(&mut root_pkg)

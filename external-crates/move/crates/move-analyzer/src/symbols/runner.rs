@@ -53,12 +53,14 @@ impl SymbolicatorRunner {
     }
 
     /// Create a new runner
-    pub fn new<F: MoveFlavor>(
+    // `'static` is required because `F` is moved into a `thread::spawn` closure
+    pub fn new<F: MoveFlavor + 'static>(
         ide_files_root: VfsPath,
         symbols_map: Arc<Mutex<BTreeMap<PathBuf, Symbols>>>,
         packages_info: Arc<Mutex<CachedPackages>>,
         sender: Sender<Result<BTreeMap<PathBuf, Vec<Diagnostic>>>>,
         lint: LintLevel,
+        move_flavor: Arc<F>,
         flavor: Option<Flavor>,
         parent_process_id: Option<u32>,
     ) -> Self {
@@ -151,6 +153,7 @@ impl SymbolicatorRunner {
                                 ide_files_root.clone(),
                                 pkg_path.as_path(),
                                 lint,
+                                move_flavor.clone(),
                                 None,
                                 flavor,
                             ) {
