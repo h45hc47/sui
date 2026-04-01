@@ -42,6 +42,7 @@ use sui_swarm_config::network_config::NetworkConfig;
 use sui_types::base_types::{AuthorityName, ObjectID};
 use sui_types::crypto::AuthorityKeyPair;
 use sui_types::digests::ChainIdentifier;
+use sui_types::node_role::NodeRole;
 use sui_types::executable_transaction::VerifiedExecutableTransaction;
 use sui_types::object::Object;
 use sui_types::sui_system_state::SuiSystemStateTrait;
@@ -314,6 +315,7 @@ impl<'a> TestAuthorityBuilder<'a> {
         let epoch_store = AuthorityPerEpochStore::new(
             name,
             Arc::new(genesis_committee.clone()),
+            NodeRole::Validator, // Tests assume validator role by default
             &path.join("store"),
             None,
             EpochMetrics::new(&registry),

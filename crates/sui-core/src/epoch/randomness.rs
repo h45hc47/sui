@@ -183,6 +183,11 @@ impl RandomnessManager {
                 return None;
             }
         };
+
+        // Check if this is an Observer node
+        if epoch_store.is_observer() {
+            info!("Initializing RandomnessManager in Observer mode - will not participate in DKG or generate randomness");
+        }
         let tables = match epoch_store.tables() {
             Ok(tables) => tables,
             Err(_) => {
@@ -400,6 +405,12 @@ impl RandomnessManager {
         let _ = self.dkg_start_time.set(Instant::now());
 
         let epoch_store = self.epoch_store()?;
+
+        // Observer nodes don't participate in DKG - they only replay messages
+        if epoch_store.is_observer() {
+            info!("Observer node will not send DKG messages - waiting to replay messages from consensus");
+            return Ok(());
+        }
         let dkg_version = epoch_store.protocol_config().dkg_version();
         info!("random beacon: starting DKG, version {dkg_version}");
 
@@ -486,20 +497,25 @@ impl RandomnessManager {
                     }
                     consensus_output.insert_dkg_used_messages(used_msgs);
 
-                    let transaction = ConsensusTransaction::new_randomness_dkg_confirmation(
-                        epoch_store.name,
-                        &conf,
-                    );
+                    // Observer nodes don't send DKG confirmations
+                    if !epoch_store.is_observer() {
+                        let transaction = ConsensusTransaction::new_randomness_dkg_confirmation(
+                            epoch_store.name,
+                            &conf,
+                        );
 
-                    #[allow(unused_mut)]
-                    let mut fail_point_skip_sending = false;
-                    fail_point_if!("rb-dkg", || {
-                        // maybe skip sending in simtests
-                        fail_point_skip_sending = true;
-                    });
-                    if !fail_point_skip_sending {
-                        self.consensus_adapter
-                            .submit_to_consensus(&[transaction], &epoch_store)?;
+                        #[allow(unused_mut)]
+                        let mut fail_point_skip_sending = false;
+                        fail_point_if!("rb-dkg", || {
+                            // maybe skip sending in simtests
+                            fail_point_skip_sending = true;
+                        });
+                        if !fail_point_skip_sending {
+                            self.consensus_adapter
+                                .submit_to_consensus(&[transaction], &epoch_store)?;
+                        }
+                    } else {
+                        info!("Observer node skipping DKG confirmation sending - only observing");
                     }
 
                     let elapsed = self.dkg_start_time.get().map(|t| t.elapsed().as_millis());
@@ -711,6 +727,14 @@ impl RandomnessManager {
 
     /// Starts the process of generating the given RandomnessRound.
     pub fn generate_randomness(&self, epoch: EpochId, randomness_round: RandomnessRound) {
+        // Observer nodes cannot generate partial signatures
+        if let Ok(epoch_store) = self.epoch_store() {
+            if epoch_store.is_observer() {
+                debug!("Observer node skipping randomness generation for round {}", randomness_round.0);
+                return;
+            }
+        }
+
         self.network_handle
             .send_partial_signatures(epoch, randomness_round);
     }

@@ -41,7 +41,7 @@ use sui_simulator::anemo::PeerId;
 use sui_types::base_types::AuthorityName;
 use sui_types::base_types::TransactionDigest;
 use sui_types::committee::Committee;
-use sui_types::error::{SuiErrorKind, SuiResult};
+use sui_types::error::{SuiError, SuiErrorKind, SuiResult};
 use sui_types::fp_ensure;
 use sui_types::messages_consensus::ConsensusPosition;
 use sui_types::messages_consensus::ConsensusTransactionKind;
@@ -344,6 +344,14 @@ impl ConsensusAdapter {
     }
 
     pub fn submit_recovered(self: &Arc<Self>, epoch_store: &Arc<AuthorityPerEpochStore>) {
+        // Observer nodes should not resend transactions to consensus during recovery
+        if epoch_store.is_observer() {
+            info!(
+                "Observer node skipping transaction recovery - observers do not submit to consensus"
+            );
+            return;
+        }
+
         // Transactions being sent to consensus can be dropped on crash, before included in a proposed block.
         // System transactions do not have clients to retry them. They need to be resubmitted to consensus on restart.
         // get_all_pending_consensus_transactions() can return both system and certified transactions though.
@@ -644,6 +652,11 @@ impl ConsensusAdapter {
         tx_consensus_position: Option<oneshot::Sender<Vec<ConsensusPosition>>>,
         submitter_client_addr: Option<IpAddr>,
     ) -> SuiResult<JoinHandle<()>> {
+        // Observer nodes should not submit transactions to consensus
+        if epoch_store.is_observer() {
+            return Err(SuiError::from("Observer nodes cannot submit transactions to consensus"));
+        }
+
         if transactions.len() > 1 {
             // When batching multiple transactions, ensure they are all of the same kind
             // (either all CertifiedTransaction or all UserTransaction).

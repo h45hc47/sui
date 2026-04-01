@@ -53,6 +53,7 @@ use sui_types::digests::{
     ChainIdentifier, CheckpointDigest, TransactionDigest, TransactionEffectsDigest,
 };
 use sui_types::messages_consensus::AuthorityCapabilitiesV2;
+use sui_types::node_role::NodeRole;
 use sui_types::sui_system_state::SuiSystemState;
 use tap::tap::TapFallible;
 use tokio::sync::oneshot;
@@ -94,7 +95,8 @@ use sui_core::authority_server::{ValidatorService, ValidatorServiceMetrics};
 use sui_core::checkpoints::checkpoint_executor::metrics::CheckpointExecutorMetrics;
 use sui_core::checkpoints::checkpoint_executor::{CheckpointExecutor, StopReason};
 use sui_core::checkpoints::{
-    CheckpointMetrics, CheckpointService, CheckpointStore, SendCheckpointToStateSync,
+    CheckpointMetrics, CheckpointOutputTrait as CheckpointOutput, CheckpointService,
+    CheckpointStore, ObserverCheckpointOutput, SendCheckpointToStateSync,
     SubmitCheckpointToConsensus,
 };
 use sui_core::consensus_adapter::{
@@ -163,7 +165,7 @@ mod handle;
 pub mod metrics;
 
 pub struct ValidatorComponents {
-    validator_server_handle: SpawnOnce,
+    validator_server_handle: Option<SpawnOnce>,
     validator_overload_monitor_handle: Option<JoinHandle<()>>,
     consensus_manager: Arc<ConsensusManager>,
     consensus_store_pruner: ConsensusStorePruner,
@@ -469,8 +471,8 @@ impl SuiNode {
         let run_with_range = config.run_with_range;
         // Check if node has consensus configuration
         let has_consensus_config = config.consensus_config().is_some();
-        // Check if node has observer peers configured
-        let has_observer_peers = config
+        // Check if node has observer peers configured (used for logging/debugging)
+        let _has_observer_peers = config
             .consensus_config()
             .and_then(|c| c.parameters.as_ref())
             .map(|p| !p.tonic.observer_peers.is_empty())
@@ -593,10 +595,28 @@ impl SuiNode {
                 .unwrap_or(highest_executed_checkpoint)
         };
 
+        // Determine the node role for this epoch
+        let is_validator = committee.authority_exists(&config.protocol_public_key());
+        let has_consensus_config = config.consensus_config().is_some();
+        let has_observer_peers = config
+            .consensus_config()
+            .and_then(|c| c.parameters.as_ref())
+            .map(|p| !p.tonic.observer_peers.is_empty())
+            .unwrap_or(false);
+
+        let node_role = match (is_validator, has_consensus_config, has_observer_peers) {
+            (true, _, _) => NodeRole::Validator,
+            (false, true, true) => NodeRole::Observer,
+            _ => NodeRole::FullNode,
+        };
+
+        info!("Node role for epoch {}: {}", cur_epoch, node_role);
+
         let epoch_options = default_db_options().optimize_db_for_write_throughput(4);
         let epoch_store = AuthorityPerEpochStore::new(
             config.protocol_public_key(),
             committee.clone(),
+            node_role,
             &config.db_path().join("store"),
             Some(epoch_options.options),
             EpochMetrics::new(&registry_service.default_registry()),
@@ -907,9 +927,10 @@ impl SuiNode {
             if is_validator_in_committee {
                 components.consensus_adapter.submit_recovered(&epoch_store);
 
-                // Start the gRPC server
-                components.validator_server_handle =
-                    components.validator_server_handle.start().await;
+                // Start the gRPC server (only for validators, not observers)
+                if let Some(handle) = components.validator_server_handle {
+                    components.validator_server_handle = Some(handle.start().await);
+                }
 
                 // Set the consensus address updater so that we can update the consensus peer addresses when requested.
                 endpoint_manager
@@ -1338,13 +1359,21 @@ impl SuiNode {
         let sui_tx_validator_metrics =
             SuiTxValidatorMetrics::new(&registry_service.default_registry());
 
-        let validator_server_handle = Self::start_grpc_validator_service(
-            &config,
-            state.clone(),
-            consensus_adapter.clone(),
-            &registry_service.default_registry(),
-        )
-        .await?;
+        // Only start gRPC validator service for actual validators, not observers
+        let validator_server_handle = if is_validator {
+            Some(
+                Self::start_grpc_validator_service(
+                    &config,
+                    state.clone(),
+                    consensus_adapter.clone(),
+                    &registry_service.default_registry(),
+                )
+                .await?,
+            )
+        } else {
+            info!("Observer node - skipping validator gRPC service");
+            None
+        };
 
         // Starts an overload monitor that monitors the execution of the authority.
         // Don't start the overload monitor when max_load_shedding_percentage is 0.
@@ -1398,7 +1427,7 @@ impl SuiNode {
         consensus_store_pruner: ConsensusStorePruner,
         state_hasher: Weak<GlobalStateHasher>,
         backpressure_manager: Arc<BackpressureManager>,
-        validator_server_handle: SpawnOnce,
+        validator_server_handle: Option<SpawnOnce>,
         validator_overload_monitor_handle: Option<JoinHandle<()>>,
         checkpoint_metrics: Arc<CheckpointMetrics>,
         sui_node_metrics: Arc<SuiNodeMetrics>,
@@ -1549,15 +1578,23 @@ impl SuiNode {
             epoch_start_timestamp_ms, epoch_duration_ms
         );
 
-        let checkpoint_output = Box::new(SubmitCheckpointToConsensus {
-            sender: consensus_adapter,
-            signer: state.secret.clone(),
-            authority: config.protocol_public_key(),
-            next_reconfiguration_timestamp_ms: epoch_start_timestamp_ms
-                .checked_add(epoch_duration_ms)
-                .expect("Overflow calculating next_reconfiguration_timestamp_ms"),
-            metrics: checkpoint_metrics.clone(),
-        });
+        let checkpoint_output: Box<dyn CheckpointOutput> = if epoch_store.is_observer() {
+            // Observer nodes create checkpoints locally without signing or submitting to consensus
+            Box::new(ObserverCheckpointOutput {
+                metrics: checkpoint_metrics.clone(),
+            })
+        } else {
+            // Validators sign and submit checkpoint signatures to consensus
+            Box::new(SubmitCheckpointToConsensus {
+                sender: consensus_adapter,
+                signer: state.secret.clone(),
+                authority: config.protocol_public_key(),
+                next_reconfiguration_timestamp_ms: epoch_start_timestamp_ms
+                    .checked_add(epoch_duration_ms)
+                    .expect("Overflow calculating next_reconfiguration_timestamp_ms"),
+                metrics: checkpoint_metrics.clone(),
+            })
+        };
 
         let certified_checkpoint_output = SendCheckpointToStateSync::new(state_sync_handle);
         let max_tx_per_checkpoint = max_tx_per_checkpoint(epoch_store.protocol_config());
@@ -1994,8 +2031,10 @@ impl SuiNode {
                     .await?;
 
                     if is_validator_in_new_epoch {
-                        components.validator_server_handle =
-                            components.validator_server_handle.start().await;
+                        // Start the gRPC server (only for validators, not observers)
+                        if let Some(handle) = components.validator_server_handle {
+                            components.validator_server_handle = Some(handle.start().await);
+                        }
 
                         // Set the consensus address updater as the full node got promoted to a validator.
                         self.endpoint_manager

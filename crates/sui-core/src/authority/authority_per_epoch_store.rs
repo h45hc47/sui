@@ -63,6 +63,7 @@ use sui_types::messages_consensus::{
     ConsensusTransaction, ConsensusTransactionKey, ConsensusTransactionKind, TimestampMs,
     VersionedDkgConfirmation, check_total_jwk_size,
 };
+use sui_types::node_role::NodeRole;
 use sui_types::signature::GenericSignature;
 use sui_types::storage::{BackingPackageStore, InputKey, ObjectStore};
 use sui_types::sui_system_state::epoch_start_sui_system_state::{
@@ -351,6 +352,9 @@ pub struct AuthorityPerEpochStore {
 
     /// Committee of validators for the current epoch.
     committee: Arc<Committee>,
+
+    /// The role of this node (Validator, Observer, or FullNode)
+    node_role: NodeRole,
 
     /// Holds the underlying per-epoch typed store tables.
     /// This is an ArcSwapOption because it needs to be used concurrently,
@@ -1085,6 +1089,7 @@ impl AuthorityPerEpochStore {
     pub fn new(
         name: AuthorityName,
         committee: Arc<Committee>,
+        node_role: NodeRole,
         parent_path: &Path,
         db_options: Option<Options>,
         metrics: Arc<EpochMetrics>,
@@ -1275,6 +1280,7 @@ impl AuthorityPerEpochStore {
         let s = Arc::new(Self {
             name,
             committee: committee.clone(),
+            node_role,
             protocol_config,
             tables: ArcSwapOption::new(Some(Arc::new(tables))),
             consensus_output_cache,
@@ -1485,6 +1491,7 @@ impl AuthorityPerEpochStore {
         Self::new(
             name,
             Arc::new(new_committee),
+            self.node_role,
             &self.parent_path,
             self.db_options.clone(),
             self.metrics.clone(),
@@ -3965,7 +3972,22 @@ impl AuthorityPerEpochStore {
 
     /// Whether this node is a validator in this epoch.
     pub fn is_validator(&self) -> bool {
-        self.committee.authority_exists(&self.name)
+        self.node_role.is_validator()
+    }
+
+    /// Whether this node is an observer in this epoch.
+    pub fn is_observer(&self) -> bool {
+        self.node_role.is_observer()
+    }
+
+    /// Whether this node is a full node in this epoch.
+    pub fn is_fullnode(&self) -> bool {
+        self.node_role.is_fullnode()
+    }
+
+    /// Get the node role for this epoch.
+    pub fn node_role(&self) -> NodeRole {
+        self.node_role
     }
 }
 
