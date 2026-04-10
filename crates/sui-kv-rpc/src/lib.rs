@@ -25,7 +25,11 @@ use tonic::transport::ServerTlsConfig;
 use tracing::error;
 
 mod package_store;
+pub mod proto;
 mod v2;
+mod v2alpha;
+
+use proto::sui::rpc::kv::v2alpha::list_service_server::ListServiceServer;
 
 use package_store::BigTablePackageStore;
 
@@ -171,7 +175,8 @@ impl KvRpcServer {
             .layer(CallbackLayer::new(RpcMetricsMakeCallbackHandler::new(
                 Arc::new(RpcMetrics::new(&registry)),
             )))
-            .add_service(LedgerServiceServer::new(self));
+            .add_service(LedgerServiceServer::new(self.clone()))
+            .add_service(ListServiceServer::new(self));
 
         if config.enable_reflection {
             let reflection_v1 = tonic_reflection::server::Builder::configure()

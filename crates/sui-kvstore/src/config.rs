@@ -163,6 +163,7 @@ impl ConcurrentLayer {
 #[DefaultConfig]
 #[derive(Clone, Default, Debug)]
 pub struct PipelineLayer {
+    pub bitmap_index: ConcurrentLayer,
     pub checkpoints: ConcurrentLayer,
     pub checkpoints_by_digest: ConcurrentLayer,
     pub transactions: ConcurrentLayer,
@@ -174,6 +175,8 @@ pub struct PipelineLayer {
     pub packages_by_id: ConcurrentLayer,
     pub packages_by_checkpoint: ConcurrentLayer,
     pub system_packages: ConcurrentLayer,
+    pub tx_seq_digest: ConcurrentLayer,
+    pub event_bitmap_index: ConcurrentLayer,
 }
 
 /// This type is identical to [`framework::ingestion::IngestionConfig`], but is set-up to be

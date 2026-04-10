@@ -45,20 +45,27 @@ use sui_types::transaction::Transaction;
 
 pub use crate::bigtable::client::BigTableClient;
 pub use crate::bigtable::client::PoolConfig;
+pub use crate::bigtable::client::bitmap_query::BitmapIndexSpec;
+pub use crate::bigtable::client::bitmap_query::BitmapQuery;
 pub use crate::bigtable::store::BigTableConnection;
 pub use crate::bigtable::store::BigTableStore;
 pub use crate::handlers::BigTableHandler;
+pub use crate::handlers::BitmapIndexHandler;
+pub use crate::handlers::BitmapIndexProcessor;
 pub use crate::handlers::CheckpointsByDigestPipeline;
 pub use crate::handlers::CheckpointsPipeline;
 pub use crate::handlers::EpochEndPipeline;
 pub use crate::handlers::EpochStartPipeline;
+pub use crate::handlers::EventBitmapProcessor;
 pub use crate::handlers::ObjectsPipeline;
 pub use crate::handlers::PackagesByCheckpointPipeline;
 pub use crate::handlers::PackagesByIdPipeline;
 pub use crate::handlers::PackagesPipeline;
 pub use crate::handlers::ProtocolConfigsPipeline;
 pub use crate::handlers::SystemPackagesPipeline;
+pub use crate::handlers::TransactionBitmapProcessor;
 pub use crate::handlers::TransactionsPipeline;
+pub use crate::handlers::TxSeqDigestPipeline;
 pub use config::BigtablePoolLayer;
 pub use config::CommitterLayer;
 pub use config::ConcurrentLayer;
@@ -66,6 +73,8 @@ pub use config::IndexerConfig;
 pub use config::IngestionConfig;
 pub use config::PipelineLayer;
 
+pub const BITMAP_INDEX_PIPELINE: &str =
+    <BitmapIndexHandler<TransactionBitmapProcessor> as sui_indexer_alt_framework::pipeline::Processor>::NAME;
 pub const CHECKPOINTS_PIPELINE: &str =
     <BigTableHandler<CheckpointsPipeline> as sui_indexer_alt_framework::pipeline::Processor>::NAME;
 pub const CHECKPOINTS_BY_DIGEST_PIPELINE: &str =
@@ -88,9 +97,14 @@ pub const PACKAGES_BY_CHECKPOINT_PIPELINE: &str =
     <BigTableHandler<PackagesByCheckpointPipeline> as sui_indexer_alt_framework::pipeline::Processor>::NAME;
 pub const SYSTEM_PACKAGES_PIPELINE: &str =
     <BigTableHandler<SystemPackagesPipeline> as sui_indexer_alt_framework::pipeline::Processor>::NAME;
+pub const TX_SEQ_DIGEST_PIPELINE: &str =
+    <BigTableHandler<TxSeqDigestPipeline> as sui_indexer_alt_framework::pipeline::Processor>::NAME;
+pub const EVENT_BITMAP_INDEX_PIPELINE: &str =
+    <BitmapIndexHandler<EventBitmapProcessor> as sui_indexer_alt_framework::pipeline::Processor>::NAME;
 
 /// All pipeline names registered by the indexer.
-pub const ALL_PIPELINE_NAMES: [&str; 11] = [
+pub const ALL_PIPELINE_NAMES: [&str; 14] = [
+    BITMAP_INDEX_PIPELINE,
     CHECKPOINTS_PIPELINE,
     CHECKPOINTS_BY_DIGEST_PIPELINE,
     TRANSACTIONS_PIPELINE,
@@ -102,6 +116,8 @@ pub const ALL_PIPELINE_NAMES: [&str; 11] = [
     PACKAGES_BY_ID_PIPELINE,
     PACKAGES_BY_CHECKPOINT_PIPELINE,
     SYSTEM_PACKAGES_PIPELINE,
+    TX_SEQ_DIGEST_PIPELINE,
+    EVENT_BITMAP_INDEX_PIPELINE,
 ];
 
 static WRITE_LEGACY_DATA: OnceLock<bool> = OnceLock::new();
@@ -347,6 +363,16 @@ impl BigTableIndexer {
 
         indexer
             .concurrent_pipeline(
+                BitmapIndexHandler::new(
+                    TransactionBitmapProcessor,
+                    &pipeline.bitmap_index,
+                    build_rate_limiter(&pipeline.bitmap_index, base_rps, &global),
+                ),
+                pipeline.bitmap_index.finish(base.clone()),
+            )
+            .await?;
+        indexer
+            .concurrent_pipeline(
                 BigTableHandler::new(
                     CheckpointsPipeline,
                     &pipeline.checkpoints,
@@ -453,6 +479,26 @@ impl BigTableIndexer {
                     build_rate_limiter(&pipeline.system_packages, base_rps, &global),
                 ),
                 pipeline.system_packages.finish(base.clone()),
+            )
+            .await?;
+        indexer
+            .concurrent_pipeline(
+                BigTableHandler::new(
+                    TxSeqDigestPipeline,
+                    &pipeline.tx_seq_digest,
+                    build_rate_limiter(&pipeline.tx_seq_digest, base_rps, &global),
+                ),
+                pipeline.tx_seq_digest.finish(base.clone()),
+            )
+            .await?;
+        indexer
+            .concurrent_pipeline(
+                BitmapIndexHandler::new(
+                    EventBitmapProcessor,
+                    &pipeline.event_bitmap_index,
+                    build_rate_limiter(&pipeline.event_bitmap_index, base_rps, &global),
+                ),
+                pipeline.event_bitmap_index.finish(base.clone()),
             )
             .await?;
 
