@@ -15415,6 +15415,7 @@ dependencies = [
  "sui-rpc",
  "sui-sdk",
  "sui-simulator",
+ "sui-sql-macro",
  "sui-storage",
  "sui-swarm-config",
  "sui-test-transaction-builder",
