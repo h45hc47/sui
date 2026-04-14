@@ -46,3 +46,4 @@ tonic-prost-build.workspace = true
 protox.workspace = true
 walkdir.workspace = true
 serde_json.workspace = true
+prost.workspace = true

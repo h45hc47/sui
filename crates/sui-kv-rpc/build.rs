@@ -63,6 +63,11 @@ fn main() {
     let file_descriptors = protox::compile(proto_files, [sui_proto_dir, sui_rpc_proto_dir])
         .expect("failed to compile proto files");
 
+    // Emit the encoded FileDescriptorSet for gRPC reflection.
+    let fds_path = out_dir.join("sui.rpc.kv.v2alpha.fds.bin");
+    fs::write(&fds_path, prost::Message::encode_to_vec(&file_descriptors))
+        .expect("write file descriptor set");
+
     tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)

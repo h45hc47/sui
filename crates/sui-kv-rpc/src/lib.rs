@@ -189,6 +189,9 @@ impl KvRpcServer {
                 .register_encoded_file_descriptor_set(
                     sui_rpc::proto::sui::rpc::v2::FILE_DESCRIPTOR_SET,
                 )
+                .register_encoded_file_descriptor_set(
+                    crate::proto::sui::rpc::kv::v2alpha::FILE_DESCRIPTOR_SET,
+                )
                 .build_v1()?;
             let reflection_v1alpha = tonic_reflection::server::Builder::configure()
                 .register_encoded_file_descriptor_set(
@@ -199,6 +202,9 @@ impl KvRpcServer {
                 )
                 .register_encoded_file_descriptor_set(
                     sui_rpc::proto::sui::rpc::v2::FILE_DESCRIPTOR_SET,
+                )
+                .register_encoded_file_descriptor_set(
+                    crate::proto::sui::rpc::kv::v2alpha::FILE_DESCRIPTOR_SET,
                 )
                 .build_v1alpha()?;
             router = router
