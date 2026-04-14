@@ -4807,6 +4807,7 @@ impl ProtocolConfig {
                     }
                     cfg.feature_flags
                         .early_return_receive_object_mismatched_type = true;
+                    cfg.feature_flags.limit_groth16_pvk_inputs = true;
                 }
                 122 => {}
                 // Use this template when making changes:
