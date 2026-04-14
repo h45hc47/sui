@@ -116,23 +116,6 @@ impl MockBigtableServer {
             .cloned()
     }
 
-    /// Pre-seed a cell value in the in-memory store.
-    pub async fn put_cell(
-        &self,
-        table: &str,
-        row_key: &[u8],
-        family: &str,
-        column: &[u8],
-        value: Bytes,
-    ) {
-        let mut state = self.state.lock().await;
-        let row = state
-            .rows
-            .entry((table.to_string(), Bytes::copy_from_slice(row_key)))
-            .or_default();
-        row.insert((family.to_string(), Bytes::copy_from_slice(column)), value);
-    }
-
     /// Start the mock server on a random available port.
     /// Returns the socket address the server is listening on.
     pub async fn start(&self) -> Result<(SocketAddr, tokio::task::JoinHandle<()>)> {
@@ -186,22 +169,34 @@ impl Bigtable for MockBigtableServer {
         let req = request.into_inner();
         let mut state = self.state.lock().await;
 
-        assert!(
-            !state.expectations.is_empty(),
-            "Unexpected MutateRows call with keys: {:?}",
-            req.entries.iter().map(|e| &e.row_key).collect::<Vec<_>>()
-        );
-        let expected = state.expectations.remove(0);
+        let table = req
+            .table_name
+            .rsplit_once("/tables/")
+            .map(|(_, t)| t.to_string())
+            .unwrap_or_default();
 
-        let actual_keys: Vec<&[u8]> = req.entries.iter().map(|e| e.row_key.as_ref()).collect();
-        assert_eq!(
-            actual_keys, expected.row_keys,
-            "MutateRows row keys mismatch"
-        );
+        // If callers registered expectations, enforce them (used by tests that
+        // inject failures). Otherwise, accept and persist every mutation — the
+        // default permissive behavior that bitmap-handler tests rely on to
+        // read back what was written.
+        let expected = if state.expectations.is_empty() {
+            None
+        } else {
+            let expected = state.expectations.remove(0);
+            let actual_keys: Vec<&[u8]> = req.entries.iter().map(|e| e.row_key.as_ref()).collect();
+            assert_eq!(
+                actual_keys, expected.row_keys,
+                "MutateRows row keys mismatch"
+            );
+            Some(expected)
+        };
 
         let entries: Vec<Entry> = (0..req.entries.len())
             .map(|idx| {
-                let code = expected.failures.get(&idx).copied().unwrap_or(0);
+                let code = expected
+                    .as_ref()
+                    .and_then(|e| e.failures.get(&idx).copied())
+                    .unwrap_or(0);
                 Entry {
                     index: idx as i64,
                     status: Some(RpcStatus {
@@ -216,6 +211,34 @@ impl Bigtable for MockBigtableServer {
                 }
             })
             .collect();
+
+        // Persist successful mutations to the in-memory store so tests can
+        // read them back. Any entry whose injected status was non-zero (a
+        // failure) is skipped.
+        for (idx, entry) in req.entries.iter().enumerate() {
+            let code = expected
+                .as_ref()
+                .and_then(|e| e.failures.get(&idx).copied())
+                .unwrap_or(0);
+            if code != 0 {
+                continue;
+            }
+            let row = state
+                .rows
+                .entry((table.clone(), entry.row_key.clone()))
+                .or_default();
+            for m in &entry.mutations {
+                if let Some(mutation::Mutation::SetCell(set_cell)) = &m.mutation {
+                    row.insert(
+                        (
+                            set_cell.family_name.clone(),
+                            set_cell.column_qualifier.clone(),
+                        ),
+                        set_cell.value.clone(),
+                    );
+                }
+            }
+        }
 
         let response = MutateRowsResponse {
             entries,

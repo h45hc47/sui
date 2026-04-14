@@ -15963,6 +15963,7 @@ dependencies = [
  "bcs",
  "bytes",
  "clap",
+ "fastcrypto",
  "futures",
  "gcp_auth",
  "governor",

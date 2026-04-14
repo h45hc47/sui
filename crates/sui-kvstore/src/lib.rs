@@ -327,6 +327,16 @@ impl BigTableIndexer {
         chain: Chain,
         registry: &Registry,
     ) -> Result<Self> {
+        // Register bitmap-index pipelines before the indexer consumes the
+        // store. `set_committer_watermark` and `merge_bitmap` both look up
+        // registered buffers by pipeline name.
+        store
+            .register_bitmap_pipeline::<TransactionBitmapProcessor>()
+            .await?;
+        store
+            .register_bitmap_pipeline::<EventBitmapProcessor>()
+            .await?;
+
         let mut indexer = Indexer::new(
             store,
             indexer_args,
@@ -363,11 +373,7 @@ impl BigTableIndexer {
 
         indexer
             .concurrent_pipeline(
-                BitmapIndexHandler::new(
-                    TransactionBitmapProcessor,
-                    &pipeline.bitmap_index,
-                    build_rate_limiter(&pipeline.bitmap_index, base_rps, &global),
-                ),
+                BitmapIndexHandler::new(TransactionBitmapProcessor, &pipeline.bitmap_index),
                 pipeline.bitmap_index.finish(base.clone()),
             )
             .await?;
@@ -493,11 +499,7 @@ impl BigTableIndexer {
             .await?;
         indexer
             .concurrent_pipeline(
-                BitmapIndexHandler::new(
-                    EventBitmapProcessor,
-                    &pipeline.event_bitmap_index,
-                    build_rate_limiter(&pipeline.event_bitmap_index, base_rps, &global),
-                ),
+                BitmapIndexHandler::new(EventBitmapProcessor, &pipeline.event_bitmap_index),
                 pipeline.event_bitmap_index.finish(base.clone()),
             )
             .await?;

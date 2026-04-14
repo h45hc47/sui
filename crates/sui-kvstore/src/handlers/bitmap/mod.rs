@@ -1,11 +1,11 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
-pub use event_processor::EventBitmapProcessor;
+pub use crate::bigtable::store::BitmapIndexProcessor;
+pub use event_bitmap::EventBitmapProcessor;
 pub use handler::BitmapIndexHandler;
-pub use handler::BitmapIndexProcessor;
-pub use transaction_processor::TransactionBitmapProcessor;
+pub use transaction_bitmap::TransactionBitmapProcessor;
 
-mod event_processor;
+mod event_bitmap;
 mod handler;
-mod transaction_processor;
+mod transaction_bitmap;

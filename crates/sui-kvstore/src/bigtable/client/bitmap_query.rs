@@ -974,26 +974,27 @@ mod tests {
 
     #[tokio::test]
     async fn flatten_bucket_stream_edge_trimming() {
-        // BUCKET_SIZE = 100_000. tx_range = 50..250_001.
-        // Buckets covered: 0 (start=50), 1 (middle, full), 2 (end=250_001 → hi=50_001).
-        let tx_range = 50u64..250_001u64;
+        // Pick a tx_range that spans 3 buckets at the current BUCKET_SIZE,
+        // with partial start (bucket 0) and partial end (bucket 2).
+        let bs = transaction_bitmap_index::BUCKET_SIZE;
+        let tx_range = 50u64..(2 * bs + 50_001);
         let items = stream::iter(vec![
-            // bucket 0: include bits below 50 (trimmed) and some above
+            // bucket 0: bit 10 trimmed (< 50); 50 and bs-1 kept.
             Ok((0u64, {
                 let mut bm = RoaringBitmap::new();
                 bm.insert(10);
                 bm.insert(50);
-                bm.insert(99_999);
+                bm.insert((bs - 1) as u32);
                 bm
             })),
-            // bucket 1: all should pass
+            // bucket 1: middle, full pass-through.
             Ok((1u64, {
                 let mut bm = RoaringBitmap::new();
                 bm.insert(0);
-                bm.insert(99_999);
+                bm.insert((bs - 1) as u32);
                 bm
             })),
-            // bucket 2: only bits < 50_001 pass
+            // bucket 2: bit 50_001 trimmed (>= hi=50_001 relative).
             Ok((2u64, {
                 let mut bm = RoaringBitmap::new();
                 bm.insert(0);
@@ -1008,15 +1009,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             out,
-            vec![
-                50,      // bucket 0 @ 50
-                99_999,  // bucket 0 @ 99_999
-                100_000, // bucket 1 @ 0
-                199_999, // bucket 1 @ 99_999
-                200_000, // bucket 2 @ 0
-                250_000, // bucket 2 @ 50_000
-                         // 250_001 is excluded (>= hi=50_001 relative)
-            ],
+            vec![50, bs - 1, bs, 2 * bs - 1, 2 * bs, 2 * bs + 50_000,],
         );
     }
 }

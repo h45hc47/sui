@@ -6,7 +6,7 @@ pub const NAME: &str = "transaction_bitmap_index";
 pub const SCHEMA_VERSION: u32 = 1;
 /// Number of tx_sequence_numbers per bitmap bucket. Tied to SCHEMA_VERSION —
 /// changing this requires a version bump and backfill into the new version prefix.
-pub const BUCKET_SIZE: u64 = 100_000;
+pub const BUCKET_SIZE: u64 = 1_048_576;
 
 pub mod col {
     pub const BITMAP: &str = "b";

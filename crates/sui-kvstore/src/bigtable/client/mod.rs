@@ -902,7 +902,7 @@ impl BigTableClient {
 
         let keys: Vec<Vec<u8>> = tx_sequence_numbers
             .into_iter()
-            .map(|s| tx_seq_digest::encode_key(s))
+            .map(tx_seq_digest::encode_key)
             .collect();
 
         let rows = self
