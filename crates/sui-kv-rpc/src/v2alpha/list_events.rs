@@ -1,6 +1,8 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::time::Instant;
+
 use bytes::Bytes;
 use futures::StreamExt;
 use futures::TryStreamExt;
@@ -17,6 +19,7 @@ use sui_rpc::proto::sui::rpc::v2::Event as ProtoEvent;
 use sui_rpc_api::ErrorReason;
 use sui_rpc_api::RpcError;
 use sui_rpc_api::proto::google::rpc::bad_request::FieldViolation;
+use tracing::info;
 
 use super::filter::event_filter_to_query;
 use crate::PackageResolver;
@@ -34,6 +37,9 @@ pub(crate) async fn list_events(
     request: ListEventsRequest,
     resolver: &PackageResolver,
 ) -> Result<ListEventsResponse, RpcError> {
+    let total_t0 = Instant::now();
+    let filtered = request.filter.is_some();
+
     let read_mask = validate_event_read_mask(request.read_mask)?;
     let page_size = request
         .page_size
@@ -46,6 +52,7 @@ pub(crate) async fn list_events(
         .map(decode_event_page_token)
         .transpose()?;
 
+    let t0 = Instant::now();
     let event_range = resolve_event_range(
         &mut client,
         cursor,
@@ -53,13 +60,22 @@ pub(crate) async fn list_events(
         request.end_checkpoint,
     )
     .await?;
+    let resolve_range_ms = t0.elapsed().as_millis();
 
     if event_range.is_empty() {
+        info!(
+            filtered,
+            page_size,
+            resolve_range_ms,
+            total_ms = total_t0.elapsed().as_millis(),
+            "list_events: empty range"
+        );
         return Ok(ListEventsResponse::default());
     }
 
     let wants_json = read_mask.contains(ProtoEvent::JSON_FIELD.name);
 
+    let t0 = Instant::now();
     // Step 1: produce a bounded list of event picks — (event_seq, tx_seq, event_idx).
     //
     // Filtered: bitmap scan in event-space yields packed event_seqs directly.
@@ -89,6 +105,8 @@ pub(crate) async fn list_events(
     } else {
         walk_tx_seq_digest_for_events(&mut client, event_range.clone(), page_size + 1).await?
     };
+    let pick_ms = t0.elapsed().as_millis();
+    let n_candidates = picks.len();
     // Both pick sources produce event_seqs in strictly ascending order:
     // the bitmap stream walks buckets in range order with RoaringBitmap's
     // ascending iter; the tx_seq_digest range scan walks tx_seqs forward
@@ -100,15 +118,19 @@ pub(crate) async fn list_events(
     let mut unique_tx_seqs: Vec<u64> = picks.iter().map(|p| p.tx_seq).collect();
     unique_tx_seqs.sort_unstable();
     unique_tx_seqs.dedup();
+    let n_unique_txs = unique_tx_seqs.len();
+    let t0 = Instant::now();
     let fetched = client
         .get_transactions_for_seqs(unique_tx_seqs, Some(&[col::EVENTS]))
         .await?;
+    let fetch_events_ms = t0.elapsed().as_millis();
     let by_tx_seq: std::collections::HashMap<u64, (u64, sui_kvstore::TransactionData)> = fetched
         .into_iter()
         .map(|(seq, cp_seq, tx)| (seq, (cp_seq, tx)))
         .collect();
 
     // Step 3: join picks → events.
+    let t0 = Instant::now();
     let mut events: Vec<EventResult> = Vec::with_capacity(picks.len());
     for pick in picks {
         let Some((checkpoint_seq, tx)) = by_tx_seq.get(&pick.tx_seq) else {
@@ -138,11 +160,29 @@ pub(crate) async fn list_events(
         });
     }
 
+    let render_ms = t0.elapsed().as_millis();
+    let n_events = events.len();
+
     let next_page_token = if has_next {
         events.last().and_then(|e| e.cursor.clone())
     } else {
         None
     };
+
+    info!(
+        filtered,
+        wants_json,
+        page_size,
+        n_candidates,
+        n_unique_txs,
+        n_events,
+        resolve_range_ms,
+        pick_ms,
+        fetch_events_ms,
+        render_ms,
+        total_ms = total_t0.elapsed().as_millis(),
+        "list_events: done"
+    );
 
     Ok(ListEventsResponse {
         events,

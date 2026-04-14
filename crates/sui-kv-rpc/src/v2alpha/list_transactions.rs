@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use bytes::Bytes;
 use futures::StreamExt;
@@ -11,6 +12,7 @@ use sui_kvstore::KeyValueStoreReader;
 use sui_rpc_api::ErrorReason;
 use sui_rpc_api::RpcError;
 use sui_rpc_api::proto::google::rpc::bad_request::FieldViolation;
+use tracing::info;
 
 use super::filter::transaction_filter_to_query;
 use crate::PackageResolver;
@@ -31,6 +33,9 @@ pub(crate) async fn list_transactions(
     request: ListTransactionsRequest,
     resolver: &PackageResolver,
 ) -> Result<ListTransactionsResponse, RpcError> {
+    let total_t0 = Instant::now();
+    let filtered = request.filter.is_some();
+
     let read_mask = validate_read_mask(request.read_mask)?;
     let page_size = request
         .page_size
@@ -43,6 +48,7 @@ pub(crate) async fn list_transactions(
         .map(decode_tx_page_token)
         .transpose()?;
 
+    let t0 = Instant::now();
     let tx_range = resolve_tx_range(
         &client,
         cursor,
@@ -50,16 +56,20 @@ pub(crate) async fn list_transactions(
         request.end_checkpoint,
     )
     .await?;
+    let resolve_range_ms = t0.elapsed().as_millis();
 
     if tx_range.is_empty() {
+        info!(
+            filtered,
+            page_size,
+            resolve_range_ms,
+            total_ms = total_t0.elapsed().as_millis(),
+            "list_transactions: empty range"
+        );
         return Ok(ListTransactionsResponse::default());
     }
 
-    // Collect up to page_size + 1 candidate tx_sequence_numbers. If a filter is
-    // set, evaluate the bitmap query; otherwise walk the tx range directly.
-    // Bounding to page_size + 1 BEFORE chunking lets the bitmap scan stop
-    // reading buckets as soon as we have enough candidates. List_transactions
-    // is 1-to-1 (each tx_seq → one result), so this is an exact ceiling.
+    let t0 = Instant::now();
     let seqs: Vec<u64> = if let Some(filter) = &request.filter {
         let query = transaction_filter_to_query(filter)?;
         client
@@ -70,30 +80,46 @@ pub(crate) async fn list_transactions(
     } else {
         tx_range.take(page_size + 1).collect()
     };
+    let bitmap_scan_ms = t0.elapsed().as_millis();
+    let n_candidates = seqs.len();
 
     // Two multi_gets: resolve tx_seqs → digests, then fetch the tx rows.
-    // Output arrives in an unspecified order; sort by tx_seq for stable paging.
     let columns = transaction_columns(&read_mask);
+    let t0 = Instant::now();
     let mut page = client
         .get_transactions_for_seqs(seqs, Some(&columns))
         .await?;
+    let fetch_txs_ms = t0.elapsed().as_millis();
     page.sort_by_key(|(seq, _, _)| *seq);
 
     let has_next = page.len() > page_size;
     page.truncate(page_size);
 
     if page.is_empty() {
+        info!(
+            filtered,
+            page_size,
+            resolve_range_ms,
+            bitmap_scan_ms,
+            fetch_txs_ms,
+            total_ms = total_t0.elapsed().as_millis(),
+            "list_transactions: empty page"
+        );
         return Ok(ListTransactionsResponse::default());
     }
 
-    // Fetch objects for type resolution if needed.
+    let t0 = Instant::now();
     let objects = if needs_object_types(&read_mask) {
         fetch_object_map(&mut client, page.iter().map(|(_, _, tx)| tx)).await?
     } else {
         HashMap::new()
     };
+    let fetch_objects_ms = t0.elapsed().as_millis();
+    let n_objects = objects.len();
 
     let last_tx_seq = page.last().map(|(seq, _, _)| *seq);
+    let n_page = page.len();
+    let t0 = Instant::now();
     let mut transactions = Vec::with_capacity(page.len());
     for (tx_seq, checkpoint_seq, tx_data) in page {
         let executed = transaction_to_response(tx_data, &read_mask, &objects, resolver).await?;
@@ -104,12 +130,28 @@ pub(crate) async fn list_transactions(
             ..Default::default()
         });
     }
+    let render_ms = t0.elapsed().as_millis();
 
     let next_page_token = if has_next {
         last_tx_seq.map(encode_tx_page_token)
     } else {
         None
     };
+
+    info!(
+        filtered,
+        page_size,
+        n_candidates,
+        n_page,
+        n_objects,
+        resolve_range_ms,
+        bitmap_scan_ms,
+        fetch_txs_ms,
+        fetch_objects_ms,
+        render_ms,
+        total_ms = total_t0.elapsed().as_millis(),
+        "list_transactions: done"
+    );
 
     Ok(ListTransactionsResponse {
         transactions,
