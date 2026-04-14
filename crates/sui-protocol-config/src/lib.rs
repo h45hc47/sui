@@ -1054,6 +1054,11 @@ struct FeatureFlags {
     // If true, return early on type mismatch in receive_object.
     #[serde(skip_serializing_if = "is_false")]
     early_return_receive_object_mismatched_type: bool,
+
+    // If true, groth16::prepare_verifying_key checks that the verifying key has no more than
+    // MAX_PUBLIC_INPUTS public inputs.
+    #[serde(skip_serializing_if = "is_false")]
+    limit_groth16_pvk_inputs: bool,
 }
 
 fn is_false(b: &bool) -> bool {
@@ -2748,6 +2753,10 @@ impl ProtocolConfig {
     pub fn early_return_receive_object_mismatched_type(&self) -> bool {
         self.feature_flags
             .early_return_receive_object_mismatched_type
+    }
+
+    pub fn limit_groth16_pvk_inputs(&self) -> bool {
+        self.feature_flags.limit_groth16_pvk_inputs
     }
 }
 
