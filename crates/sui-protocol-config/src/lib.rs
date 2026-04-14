@@ -1941,6 +1941,10 @@ pub struct ProtocolConfig {
 
     /// Max tps for gasless transactions. Unlimited when unset, zero when set to zero.
     gasless_max_tps: Option<u64>,
+
+    /// Maximum serialized size in bytes of a gasless transaction (SenderSignedData).
+    /// Bounds the persistent storage impact of each admitted gasless transaction.
+    gasless_max_tx_size_bytes: Option<u64>,
 }
 
 /// An aliased address.
@@ -2741,6 +2745,10 @@ impl ProtocolConfig {
         self.gasless_max_pure_input_bytes.unwrap_or(u64::MAX)
     }
 
+    pub fn get_gasless_max_tx_size_bytes(&self) -> u64 {
+        self.gasless_max_tx_size_bytes.unwrap_or(u64::MAX)
+    }
+
     pub fn disallow_jump_orphans(&self) -> bool {
         self.feature_flags.disallow_jump_orphans
     }
@@ -3334,6 +3342,7 @@ impl ProtocolConfig {
             gasless_max_unused_inputs: None,
             gasless_max_pure_input_bytes: None,
             gasless_max_tps: None,
+            gasless_max_tx_size_bytes: None,
             // When adding a new constant, set it to None in the earliest version, like this:
             // new_constant: None,
         };
@@ -4798,7 +4807,12 @@ impl ProtocolConfig {
                     cfg.feature_flags
                         .early_return_receive_object_mismatched_type = true;
                 }
-                122 => {}
+                122 => {
+                    cfg.gasless_max_tx_size_bytes = Some(16 * 1024);
+                    if chain != Chain::Mainnet {
+                        cfg.gasless_max_tps = Some(100);
+                    }
+                }
                 // Use this template when making changes:
                 //
                 //     // modify an existing constant.
@@ -5196,6 +5210,7 @@ impl ProtocolConfig {
         self.gasless_max_computation_units = Some(50_000);
         self.gasless_allowed_token_types = Some(vec![]);
         self.gasless_max_tps = Some(1000);
+        self.gasless_max_tx_size_bytes = Some(16 * 1024);
     }
 
     pub fn disable_gasless_for_testing(&mut self) {
