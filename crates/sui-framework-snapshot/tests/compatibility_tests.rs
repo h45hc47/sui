@@ -97,7 +97,7 @@ mod compatibility_tests {
                 let root_pkg = PackageLoader::new(
                     &package_path,
                     testnet_environment(),
-                    std::sync::Arc::new(SuiFlavor),
+                    std::sync::Arc::new(SuiFlavor::new()),
                 )
                 .load()
                 .await

@@ -56,7 +56,7 @@ impl Disassemble {
                 debug: self.debug,
                 bytecode_map: self.bytecode_map,
             }
-            .execute(package_path, build_config, Arc::new(SuiFlavor))
+            .execute(package_path, build_config, Arc::new(SuiFlavor::new()))
             .await?;
             return Ok(());
         }

@@ -3731,7 +3731,7 @@ pub async fn load_root_pkg_for_publish_upgrade(
     let env = find_environment(path, build_config.environment.clone(), wallet, true).await?;
 
     Ok(build_config
-        .package_loader(path, &env, Arc::new(SuiFlavor))
+        .package_loader(path, &env, Arc::new(SuiFlavor::new()))
         .load()
         .await?)
 }
@@ -3748,7 +3748,7 @@ pub async fn load_root_pkg_for_ephemeral_publish_or_upgrade(
         build_env.clone(),
         chain_id.to_string(),
         pubfile_path,
-        Arc::new(SuiFlavor),
+        Arc::new(SuiFlavor::new()),
     )
     .modes(modes)
     .load()

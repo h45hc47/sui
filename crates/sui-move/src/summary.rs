@@ -56,7 +56,7 @@ impl Summary {
             .execute(
                 path,
                 build_config,
-                Arc::new(SuiFlavor),
+                Arc::new(SuiFlavor::new()),
                 Some(&sui_package_metadata),
             )
             .await

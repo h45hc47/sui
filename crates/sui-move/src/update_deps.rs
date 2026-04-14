@@ -29,7 +29,12 @@ impl UpdateDeps {
         let environment =
             find_environment(&path, build_config.environment.clone(), wallet, false).await?;
         self.update_deps
-            .execute(Some(&path), &build_config, environment, Arc::new(SuiFlavor))
+            .execute(
+                Some(&path),
+                &build_config,
+                environment,
+                Arc::new(SuiFlavor::new()),
+            )
             .await
     }
 }
