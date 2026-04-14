@@ -290,7 +290,7 @@ pub(crate) fn needs_object_types(mask: &FieldMaskTree) -> bool {
         })
 }
 
-fn compute_object_keys(source: &TransactionData) -> BTreeSet<ObjectKey> {
+pub(crate) fn compute_object_keys(source: &TransactionData) -> BTreeSet<ObjectKey> {
     match (&source.transaction_data, &source.effects) {
         (Some(tx_data), Some(effects)) => sui_types::storage::get_transaction_object_set(
             tx_data,

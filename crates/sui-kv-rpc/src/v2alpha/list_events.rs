@@ -1,6 +1,7 @@
 // Copyright (c) Mysten Labs, Inc.
 // SPDX-License-Identifier: Apache-2.0
 
+use std::collections::HashMap;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -9,6 +10,7 @@ use futures::TryStreamExt;
 use sui_kvstore::BigTableClient;
 use sui_kvstore::BitmapIndexSpec;
 use sui_kvstore::KeyValueStoreReader;
+use sui_kvstore::TransactionData;
 use sui_kvstore::tables::event_bitmap_index;
 use sui_kvstore::tables::transactions::col;
 use sui_rpc::field::FieldMask;
@@ -19,7 +21,11 @@ use sui_rpc::proto::sui::rpc::v2::Event as ProtoEvent;
 use sui_rpc_api::ErrorReason;
 use sui_rpc_api::RpcError;
 use sui_rpc_api::proto::google::rpc::bad_request::FieldViolation;
+use sui_types::digests::TransactionDigest;
 use tracing::info;
+
+const CHUNK_MAX: usize = 64;
+const STAGE_CONCURRENCY: usize = 4;
 
 use super::filter::event_filter_to_query;
 use crate::PackageResolver;
@@ -114,17 +120,94 @@ pub(crate) async fn list_events(
     let has_next = picks.len() > page_size;
     picks.truncate(page_size);
 
-    // Step 2: fetch the `events` column for the unique contributing tx_seqs.
+    // Step 2: fetch the `events` column for the unique contributing tx_seqs,
+    // pipelined across two stages (tx_seq → digest → tx body). Rows stream
+    // from each multi_get_stream as they arrive and chunks across stages run
+    // concurrently via buffer_unordered + try_flatten_unordered.
     let mut unique_tx_seqs: Vec<u64> = picks.iter().map(|p| p.tx_seq).collect();
     unique_tx_seqs.sort_unstable();
     unique_tx_seqs.dedup();
     let n_unique_txs = unique_tx_seqs.len();
     let t0 = Instant::now();
-    let fetched = client
-        .get_transactions_for_seqs(unique_tx_seqs, Some(&[col::EVENTS]))
-        .await?;
+
+    let column_filter = BigTableClient::column_filter(&[col::EVENTS]);
+
+    // Stage 1: seq chunks → (seq, digest, cp_seq) rows.
+    let digest_rows = futures::stream::iter(unique_tx_seqs.into_iter().map(Ok::<_, RpcError>))
+        .ready_chunks(CHUNK_MAX)
+        .map({
+            let client = client.clone();
+            move |chunk| {
+                let mut client = client.clone();
+                async move {
+                    let seqs: Vec<u64> = chunk.into_iter().collect::<Result<_, _>>()?;
+                    if seqs.is_empty() {
+                        return Ok::<_, RpcError>(
+                            futures::stream::empty::<
+                                Result<(u64, TransactionDigest, u64, u32), RpcError>,
+                            >()
+                            .boxed(),
+                        );
+                    }
+                    let inner = client.resolve_tx_digests_stream(seqs).await?;
+                    Ok(inner.map_err(RpcError::from).boxed())
+                }
+            }
+        })
+        .buffer_unordered(STAGE_CONCURRENCY)
+        .try_flatten_unordered(None)
+        .boxed();
+
+    // Stage 2: digest chunks → (tx_seq, cp_seq, tx_data) rows.
+    let tx_rows = digest_rows
+        .ready_chunks(CHUNK_MAX)
+        .map({
+            let client = client.clone();
+            let column_filter = column_filter.clone();
+            move |chunk| {
+                let mut client = client.clone();
+                let column_filter = column_filter.clone();
+                async move {
+                    let rows: Vec<(u64, TransactionDigest, u64, u32)> =
+                        chunk.into_iter().collect::<Result<_, _>>()?;
+                    if rows.is_empty() {
+                        return Ok::<_, RpcError>(
+                                futures::stream::empty::<
+                                    Result<(u64, u64, TransactionData), RpcError>,
+                                >()
+                                .boxed(),
+                            );
+                    }
+                    let digests: Vec<TransactionDigest> =
+                        rows.iter().map(|(_, d, _, _)| *d).collect();
+                    let seq_map: HashMap<TransactionDigest, (u64, u64)> = rows
+                        .into_iter()
+                        .map(|(seq, d, cp, _)| (d, (seq, cp)))
+                        .collect();
+                    let inner = client
+                        .get_transactions_stream(digests, Some(column_filter))
+                        .await?;
+                    Ok(inner
+                        .map_err(RpcError::from)
+                        .and_then(move |(digest, tx)| {
+                            let entry = seq_map.get(&digest).copied();
+                            async move {
+                                let (seq, cp) = entry.ok_or_else(|| {
+                                    RpcError::new(tonic::Code::Internal, "digest not in seq_map")
+                                })?;
+                                Ok((seq, cp, tx))
+                            }
+                        })
+                        .boxed())
+                }
+            }
+        })
+        .buffer_unordered(STAGE_CONCURRENCY)
+        .try_flatten_unordered(None);
+
+    let fetched: Vec<(u64, u64, TransactionData)> = tx_rows.try_collect().await?;
     let fetch_events_ms = t0.elapsed().as_millis();
-    let by_tx_seq: std::collections::HashMap<u64, (u64, sui_kvstore::TransactionData)> = fetched
+    let by_tx_seq: HashMap<u64, (u64, TransactionData)> = fetched
         .into_iter()
         .map(|(seq, cp_seq, tx)| (seq, (cp_seq, tx)))
         .collect();

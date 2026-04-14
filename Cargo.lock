@@ -15107,7 +15107,7 @@ dependencies = [
  "itertools 0.13.0",
  "rand 0.8.5",
  "reqwest",
- "roaring 0.10.9",
+ "roaring",
  "serde",
  "serde_json",
  "simulacrum",

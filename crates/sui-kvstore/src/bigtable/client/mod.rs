@@ -503,13 +503,14 @@ impl BigTableClient {
         &mut self,
         mut request: ReadRowsRequest,
         table_name: &str,
-    ) -> Result<impl futures::Stream<Item = Result<(Bytes, Vec<(Bytes, Bytes)>)>>> {
+    ) -> Result<impl futures::Stream<Item = Result<(Bytes, Vec<(Bytes, Bytes)>)>> + use<>> {
         if let Some(ref app_profile_id) = self.app_profile_id {
             request.app_profile_id = app_profile_id.clone();
         }
         let response = self.client.clone().read_rows(request).await?.into_inner();
         let metrics = self.metrics.clone();
         let client_name = self.client_name.clone();
+        let table_name = table_name.to_owned();
 
         Ok(async_stream::try_stream! {
             // Zero-copy accumulator for cell values. BigTable streams cell data
@@ -563,7 +564,7 @@ impl BigTableClient {
 
             while let Some(message) = response.message().await? {
                 if let Some(ref metrics) = metrics {
-                    report_bt_stats_inner(metrics, &client_name, table_name, &message.request_stats);
+                    report_bt_stats_inner(metrics, &client_name, &table_name, &message.request_stats);
                 }
                 for chunk in message.chunks.into_iter() {
                     if !chunk.row_key.is_empty() {
@@ -698,6 +699,33 @@ impl BigTableClient {
     ) -> Result<Vec<(Bytes, Vec<(Bytes, Bytes)>)>> {
         let request = self.build_multi_get_request(table_name, keys, filter);
         self.read_rows(request, table_name).await
+    }
+
+    /// Build a `RowFilter` restricting the read to the given column qualifiers.
+    /// Intended for callers of streaming APIs that need to construct the filter
+    /// ahead of time (so the returned stream doesn't borrow caller scope).
+    pub fn column_filter(columns: &[&str]) -> RowFilter {
+        let pattern = format!("^({})$", columns.join("|"));
+        RowFilter {
+            filter: Some(Filter::ColumnQualifierRegexFilter(pattern.into())),
+        }
+    }
+
+    /// Streaming variant of `multi_get`. Rows arrive on the stream as soon as
+    /// BigTable writes them on the wire, so downstream stages in a pipeline
+    /// can start work before the full batch completes. Emits rows in arrival
+    /// order, which is not necessarily key order — callers that need stable
+    /// ordering should sort at the end.
+    pub async fn multi_get_stream(
+        &mut self,
+        table_name: &str,
+        keys: Vec<Vec<u8>>,
+        filter: Option<RowFilter>,
+    ) -> Result<futures::stream::BoxStream<'static, Result<(Bytes, Vec<(Bytes, Bytes)>)>>> {
+        use futures::StreamExt;
+        let request = self.build_multi_get_request(table_name, keys, filter);
+        let stream = self.read_rows_stream(request, table_name).await?;
+        Ok(stream.boxed())
     }
 
     /// Scan a range of rows with optional start/end keys, limit, and direction.
@@ -859,6 +887,97 @@ impl BigTableClient {
             .iter()
             .map(|s| by_seq.get(s).copied())
             .collect())
+    }
+
+    /// Streaming variant of `resolve_tx_digests`. Emits each resolved row as
+    /// it arrives from BigTable. Rows missing from the table are silently
+    /// dropped (same contract as the non-streaming version, minus the
+    /// position-preserving `Option` wrapping).
+    pub async fn resolve_tx_digests_stream(
+        &mut self,
+        tx_sequence_numbers: Vec<u64>,
+    ) -> Result<impl futures::Stream<Item = Result<(u64, TransactionDigest, u64, u32)>> + use<>>
+    {
+        use crate::tables::tx_seq_digest;
+
+        let keys: Vec<Vec<u8>> = tx_sequence_numbers
+            .into_iter()
+            .map(|s| tx_seq_digest::encode_key(s))
+            .collect();
+
+        let rows = self
+            .multi_get_stream(tx_seq_digest::NAME, keys, None)
+            .await?;
+
+        Ok(async_stream::try_stream! {
+            use futures::StreamExt;
+            futures::pin_mut!(rows);
+            while let Some(row) = rows.next().await {
+                let (row_key, cells) = row?;
+                let tx_seq = u64::from_be_bytes(
+                    row_key
+                        .as_ref()
+                        .try_into()
+                        .context("tx_seq_digest key not 8 bytes")?,
+                );
+                let (digest, cp_seq, event_count) = tx_seq_digest::decode(&cells)?;
+                yield (tx_seq, digest, cp_seq, event_count);
+            }
+        })
+    }
+
+    /// Streaming variant of `get_transactions_filtered`. Yields
+    /// `(TransactionDigest, TransactionData)` per row as it arrives.
+    /// Takes an owned `column_filter` so the returned stream does not borrow
+    /// from caller-scoped values (avoids lifetime capture in `impl Stream`).
+    pub async fn get_transactions_stream(
+        &mut self,
+        digests: Vec<TransactionDigest>,
+        column_filter: Option<RowFilter>,
+    ) -> Result<impl futures::Stream<Item = Result<(TransactionDigest, TransactionData)>> + use<>>
+    {
+        let keys = digests
+            .iter()
+            .map(tables::transactions::encode_key)
+            .collect();
+        let filter = column_filter;
+        let rows = self
+            .multi_get_stream(tables::transactions::NAME, keys, filter)
+            .await?;
+
+        Ok(async_stream::try_stream! {
+            use futures::StreamExt;
+            futures::pin_mut!(rows);
+            while let Some(row) = rows.next().await {
+                let (key, cells) = row?;
+                let digest = TransactionDigest::from(
+                    <[u8; 32]>::try_from(key.as_ref())
+                        .context("invalid transaction digest key length")?,
+                );
+                let tx = tables::transactions::decode(digest, &cells)?;
+                yield (digest, tx);
+            }
+        })
+    }
+
+    /// Streaming variant of `get_objects`. Yields each `Object` as it arrives.
+    pub async fn get_objects_stream(
+        &mut self,
+        object_keys: Vec<ObjectKey>,
+    ) -> Result<impl futures::Stream<Item = Result<Object>> + use<>> {
+        let keys: Vec<Vec<u8>> = object_keys.iter().map(Self::raw_object_key).collect();
+        let rows = self
+            .multi_get_stream(tables::objects::NAME, keys, None)
+            .await?;
+
+        Ok(async_stream::try_stream! {
+            use futures::StreamExt;
+            futures::pin_mut!(rows);
+            while let Some(row) = rows.next().await {
+                let (_key, cells) = row?;
+                yield tables::objects::decode(&cells)?;
+            }
+        })
     }
 
     /// Range-scan `tx_seq_digest` across `tx_range` (half-open) and yield
