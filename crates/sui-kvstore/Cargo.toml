@@ -22,6 +22,7 @@ http.workspace = true
 num_cpus.workspace = true
 gcp_auth.workspace = true
 mysten-common.workspace = true
+move-core-types.workspace = true
 prometheus.workspace = true
 rand.workspace = true
 prost.workspace = true

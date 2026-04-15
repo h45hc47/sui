@@ -41,36 +41,86 @@ impl IndexDimension {
 /// Encode a dimension value into a row key component: `[tag_byte][value_bytes]`.
 pub fn encode_dimension_key(dim: IndexDimension, value: &[u8]) -> Vec<u8> {
     let mut key = Vec::with_capacity(1 + value.len());
-    key.push(dim.tag_byte());
-    key.extend_from_slice(value);
+    write_dimension_key(&mut key, dim, value);
     key
+}
+
+/// Append a dimension key into `out` using the `[tag_byte][value_bytes]` format.
+pub fn write_dimension_key(out: &mut Vec<u8>, dim: IndexDimension, value: &[u8]) {
+    out.clear();
+    out.reserve(1 + value.len());
+    out.push(dim.tag_byte());
+    out.extend_from_slice(value);
 }
 
 // --- Compound key construction helpers ---
 // Used by both the write side (extract_dimensions) and the read side (filter parsing).
 
+/// Append a MoveCall compound value at the desired specificity into `out`.
+pub fn write_move_call_value(
+    out: &mut Vec<u8>,
+    package: &[u8],
+    module: Option<&str>,
+    function: Option<&str>,
+) {
+    out.clear();
+    out.reserve(32 + 32);
+    out.extend_from_slice(package);
+    if let Some(m) = module {
+        out.extend_from_slice(m.as_bytes());
+        if let Some(f) = function {
+            out.push(0x00);
+            out.extend_from_slice(f.as_bytes());
+        }
+    }
+}
+
 /// Build a MoveCall compound value at the desired specificity.
 pub fn move_call_value(package: &[u8], module: Option<&str>, function: Option<&str>) -> Vec<u8> {
     let mut v = Vec::with_capacity(32 + 32);
-    v.extend_from_slice(package);
-    if let Some(m) = module {
-        v.extend_from_slice(m.as_bytes());
-        if let Some(f) = function {
-            v.push(0x00);
-            v.extend_from_slice(f.as_bytes());
-        }
-    }
+    write_move_call_value(&mut v, package, module, function);
     v
+}
+
+/// Append an EmitModule compound value at the desired specificity into `out`.
+pub fn write_emit_module_value(out: &mut Vec<u8>, package_id: &[u8], module: Option<&str>) {
+    out.clear();
+    out.reserve(32 + 16);
+    out.extend_from_slice(package_id);
+    if let Some(m) = module {
+        out.extend_from_slice(m.as_bytes());
+    }
 }
 
 /// Build an EmitModule compound value at the desired specificity.
 pub fn emit_module_value(package_id: &[u8], module: Option<&str>) -> Vec<u8> {
     let mut v = Vec::with_capacity(32 + 16);
-    v.extend_from_slice(package_id);
-    if let Some(m) = module {
-        v.extend_from_slice(m.as_bytes());
-    }
+    write_emit_module_value(&mut v, package_id, module);
     v
+}
+
+/// Append an EventType compound value at the desired specificity into `out`.
+pub fn write_event_type_value(
+    out: &mut Vec<u8>,
+    type_address: &[u8],
+    module: Option<&str>,
+    name: Option<&str>,
+    instantiation_bcs: Option<&[u8]>,
+) {
+    out.clear();
+    out.reserve(32 + 32);
+    out.extend_from_slice(type_address);
+    if let Some(m) = module {
+        out.extend_from_slice(m.as_bytes());
+        if let Some(n) = name {
+            out.push(0x00);
+            out.extend_from_slice(n.as_bytes());
+            if let Some(bcs) = instantiation_bcs {
+                out.push(0x00);
+                out.extend_from_slice(bcs);
+            }
+        }
+    }
 }
 
 /// Build an EventType compound value at the desired specificity.
@@ -83,65 +133,50 @@ pub fn event_type_value(
     instantiation_bcs: Option<&[u8]>,
 ) -> Vec<u8> {
     let mut v = Vec::with_capacity(32 + 32);
-    v.extend_from_slice(type_address);
-    if let Some(m) = module {
-        v.extend_from_slice(m.as_bytes());
-        if let Some(n) = name {
-            v.push(0x00);
-            v.extend_from_slice(n.as_bytes());
-            if let Some(bcs) = instantiation_bcs {
-                v.push(0x00);
-                v.extend_from_slice(bcs);
-            }
-        }
-    }
+    write_event_type_value(&mut v, type_address, module, name, instantiation_bcs);
     v
 }
 
-/// Extract all (dimension, value) pairs from a transaction.
+/// Visit all tx-space dimensions for a transaction.
 ///
-/// Returns raw dimension values suitable for encoding into row keys.
-/// Compound dimensions emit entries at every prefix level so that
-/// queries at any specificity are a single key lookup (no intersection).
-pub fn extract_transaction_dimensions(tx: &ExecutedTransaction) -> Vec<(IndexDimension, Vec<u8>)> {
-    let mut dims = Vec::new();
+/// The callback is invoked once per logical tx-space dimension candidate.
+/// Compound dimensions are emitted at every prefix level so queries at any
+/// specificity remain a single key lookup.
+pub fn for_each_transaction_dimension(
+    tx: &ExecutedTransaction,
+    mut f: impl FnMut(IndexDimension, &[u8]),
+) {
+    let mut scratch = Vec::new();
 
-    // Sender
-    dims.push((IndexDimension::Sender, tx.transaction.sender().to_vec()));
+    f(IndexDimension::Sender, tx.transaction.sender().as_ref());
 
-    // Recipient addresses from changed objects
     for (_, owner, _) in tx.effects.all_changed_objects() {
         match owner {
-            Owner::AddressOwner(addr) => {
-                dims.push((IndexDimension::Recipient, addr.to_vec()));
-            }
+            Owner::AddressOwner(addr) => f(IndexDimension::Recipient, addr.as_ref()),
             Owner::ConsensusAddressOwner { owner, .. } => {
-                dims.push((IndexDimension::Recipient, owner.to_vec()));
+                f(IndexDimension::Recipient, owner.as_ref())
             }
             _ => {}
         }
     }
 
-    // Affected object IDs
     for change in tx.effects.object_changes() {
-        dims.push((IndexDimension::AffectedObject, change.id.to_vec()));
+        f(IndexDimension::AffectedObject, change.id.as_ref());
     }
 
-    // Move call — compound keys at package, module, and function levels
     for (_, package_id, module, function) in tx.transaction.move_calls() {
         let pkg = package_id.as_ref();
-        dims.push((IndexDimension::MoveCall, move_call_value(pkg, None, None)));
-        dims.push((
-            IndexDimension::MoveCall,
-            move_call_value(pkg, Some(module), None),
-        ));
-        dims.push((
-            IndexDimension::MoveCall,
-            move_call_value(pkg, Some(module), Some(function)),
-        ));
+
+        write_move_call_value(&mut scratch, pkg, None, None);
+        f(IndexDimension::MoveCall, &scratch);
+
+        write_move_call_value(&mut scratch, pkg, Some(module), None);
+        f(IndexDimension::MoveCall, &scratch);
+
+        write_move_call_value(&mut scratch, pkg, Some(module), Some(function));
+        f(IndexDimension::MoveCall, &scratch);
     }
 
-    // Event dimensions — compound keys at each prefix level
     for ev in tx.events.iter().flat_map(|evs| evs.data.iter()) {
         let pkg = ev.package_id.as_ref();
         let type_addr = ev.type_.address.as_ref();
@@ -149,68 +184,58 @@ pub fn extract_transaction_dimensions(tx: &ExecutedTransaction) -> Vec<(IndexDim
         let type_mod: &str = ev.type_.module.as_str();
         let type_name: &str = ev.type_.name.as_str();
 
-        // EmitModule: package_id level, then package_id+module level
-        dims.push((IndexDimension::EmitModule, emit_module_value(pkg, None)));
-        dims.push((
-            IndexDimension::EmitModule,
-            emit_module_value(pkg, Some(emit_mod)),
-        ));
+        write_emit_module_value(&mut scratch, pkg, None);
+        f(IndexDimension::EmitModule, &scratch);
 
-        // EventType: address → +module → +name → +instantiation
-        dims.push((
-            IndexDimension::EventType,
-            event_type_value(type_addr, None, None, None),
-        ));
-        dims.push((
-            IndexDimension::EventType,
-            event_type_value(type_addr, Some(type_mod), None, None),
-        ));
-        dims.push((
-            IndexDimension::EventType,
-            event_type_value(type_addr, Some(type_mod), Some(type_name), None),
-        ));
+        write_emit_module_value(&mut scratch, pkg, Some(emit_mod));
+        f(IndexDimension::EmitModule, &scratch);
+
+        write_event_type_value(&mut scratch, type_addr, None, None, None);
+        f(IndexDimension::EventType, &scratch);
+
+        write_event_type_value(&mut scratch, type_addr, Some(type_mod), None, None);
+        f(IndexDimension::EventType, &scratch);
+
+        write_event_type_value(
+            &mut scratch,
+            type_addr,
+            Some(type_mod),
+            Some(type_name),
+            None,
+        );
+        f(IndexDimension::EventType, &scratch);
 
         if !ev.type_.type_params.is_empty() {
             let params_bcs =
                 bcs::to_bytes(&ev.type_.type_params).expect("BCS encoding of type params");
-            dims.push((
-                IndexDimension::EventType,
-                event_type_value(
-                    type_addr,
-                    Some(type_mod),
-                    Some(type_name),
-                    Some(&params_bcs),
-                ),
-            ));
+
+            write_event_type_value(
+                &mut scratch,
+                type_addr,
+                Some(type_mod),
+                Some(type_name),
+                Some(&params_bcs),
+            );
+            f(IndexDimension::EventType, &scratch);
         }
     }
-
-    dims
 }
 
-/// Extract per-event dimensions from a transaction.
+/// Visit all event-space dimensions for a transaction.
 ///
-/// Returns `(dimension, value, event_idx)` tuples — one entry per
-/// `(event, dimension_prefix_level)`. Each event inherits the containing
-/// transaction's `Sender` bits so mixed tx-level + event-level filters can
-/// be evaluated entirely against the event-keyed bitmap index.
-///
-/// Compound dimensions (EmitModule, EventType) emit an entry at every prefix
-/// level, matching the read-side filter parsing.
-///
-/// Only dimensions that are filter-addressable on events today are emitted:
-/// `Sender` (tx sender), `EmitModule` (where emitted), `EventType` (what was
-/// emitted, at every prefix level).
-pub fn extract_event_dimensions(tx: &ExecutedTransaction) -> Vec<(IndexDimension, Vec<u8>, u32)> {
-    let mut dims = Vec::new();
-
-    let sender_bytes = tx.transaction.sender().to_vec();
+/// The callback receives `(event_idx, dimension, value)` once per logical
+/// event-space dimension candidate.
+pub fn for_each_event_dimension(
+    tx: &ExecutedTransaction,
+    mut f: impl FnMut(u32, IndexDimension, &[u8]),
+) {
+    let mut scratch = Vec::new();
+    let sender = tx.transaction.sender();
 
     for (idx, ev) in tx.events.iter().flat_map(|evs| evs.data.iter()).enumerate() {
         let event_idx = idx as u32;
 
-        // Sender inherited from the tx so sender-only filters resolve in event-space.
-        dims.push((IndexDimension::Sender, sender_bytes.clone(), event_idx));
+        f(event_idx, IndexDimension::Sender, sender.as_ref());
 
         let pkg = ev.package_id.as_ref();
         let type_addr = ev.type_.address.as_ref();
@@ -218,52 +243,40 @@ pub fn extract_event_dimensions(tx: &ExecutedTransaction) -> Vec<(IndexDimension
         let type_mod: &str = ev.type_.module.as_str();
         let type_name: &str = ev.type_.name.as_str();
 
-        // EmitModule: package_id level, then package_id+module level
-        dims.push((
-            IndexDimension::EmitModule,
-            emit_module_value(pkg, None),
-            event_idx,
-        ));
-        dims.push((
-            IndexDimension::EmitModule,
-            emit_module_value(pkg, Some(emit_mod)),
-            event_idx,
-        ));
+        write_emit_module_value(&mut scratch, pkg, None);
+        f(event_idx, IndexDimension::EmitModule, &scratch);
 
-        // EventType: address → +module → +name → +instantiation
-        dims.push((
-            IndexDimension::EventType,
-            event_type_value(type_addr, None, None, None),
-            event_idx,
-        ));
-        dims.push((
-            IndexDimension::EventType,
-            event_type_value(type_addr, Some(type_mod), None, None),
-            event_idx,
-        ));
-        dims.push((
-            IndexDimension::EventType,
-            event_type_value(type_addr, Some(type_mod), Some(type_name), None),
-            event_idx,
-        ));
+        write_emit_module_value(&mut scratch, pkg, Some(emit_mod));
+        f(event_idx, IndexDimension::EmitModule, &scratch);
+
+        write_event_type_value(&mut scratch, type_addr, None, None, None);
+        f(event_idx, IndexDimension::EventType, &scratch);
+
+        write_event_type_value(&mut scratch, type_addr, Some(type_mod), None, None);
+        f(event_idx, IndexDimension::EventType, &scratch);
+
+        write_event_type_value(
+            &mut scratch,
+            type_addr,
+            Some(type_mod),
+            Some(type_name),
+            None,
+        );
+        f(event_idx, IndexDimension::EventType, &scratch);
 
         if !ev.type_.type_params.is_empty() {
             let params_bcs =
                 bcs::to_bytes(&ev.type_.type_params).expect("BCS encoding of type params");
-            dims.push((
-                IndexDimension::EventType,
-                event_type_value(
-                    type_addr,
-                    Some(type_mod),
-                    Some(type_name),
-                    Some(&params_bcs),
-                ),
-                event_idx,
-            ));
+            write_event_type_value(
+                &mut scratch,
+                type_addr,
+                Some(type_mod),
+                Some(type_name),
+                Some(&params_bcs),
+            );
+            f(event_idx, IndexDimension::EventType, &scratch);
         }
     }
-
-    dims
 }
 
 #[cfg(test)]

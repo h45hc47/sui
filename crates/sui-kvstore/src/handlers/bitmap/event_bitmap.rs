@@ -11,8 +11,8 @@
 use std::sync::Arc;
 
 use bytes::Bytes;
-use sui_index_dimensions::encode_dimension_key;
-use sui_index_dimensions::extract_event_dimensions;
+use sui_index_dimensions::for_each_event_dimension;
+use sui_index_dimensions::write_dimension_key;
 use sui_indexer_alt_framework::pipeline::Processor;
 use sui_types::full_checkpoint_content::Checkpoint;
 
@@ -35,34 +35,35 @@ impl Processor for EventBitmapProcessor {
     async fn process(&self, checkpoint: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
         let cp = checkpoint.summary.data();
         let checkpoint_seq = cp.sequence_number;
-        let tx_hi_exclusive = cp.network_total_transactions;
         let timestamp_ms = cp.timestamp_ms;
         // network_total_transactions is cumulative *including* this checkpoint,
         // so tx_lo is the first tx_seq in this checkpoint.
-        let tx_lo = tx_hi_exclusive - checkpoint.transactions.len() as u64;
+        let tx_lo = cp.network_total_transactions - checkpoint.transactions.len() as u64;
 
         let mut values = Vec::new();
+        let mut dimension_key = Vec::new();
+        let mut row_key = Vec::new();
         for (i, tx) in checkpoint.transactions.iter().enumerate() {
             let tx_seq = tx_lo + i as u64;
-            for (dim, value, event_idx) in extract_event_dimensions(tx) {
+            for_each_event_dimension(tx, |event_idx, dim, value| {
                 let event_seq = event_bitmap_index::encode_event_seq(tx_seq, event_idx);
                 let bucket_id = event_seq / event_bitmap_index::BUCKET_SIZE;
                 let bit_position = (event_seq % event_bitmap_index::BUCKET_SIZE) as u32;
-                let dim_key = encode_dimension_key(dim, &value);
-                let row_key = event_bitmap_index::encode_row_key(
+                write_dimension_key(&mut dimension_key, dim, value);
+                event_bitmap_index::encode_row_key_into(
+                    &mut row_key,
                     event_bitmap_index::SCHEMA_VERSION,
-                    &dim_key,
+                    &dimension_key,
                     bucket_id,
                 );
                 values.push(BitmapIndexValue {
-                    row_key: Bytes::from(row_key),
+                    row_key: Bytes::copy_from_slice(&row_key),
                     bucket_id,
                     bit_position,
                     checkpoint_seq,
-                    tx_hi_exclusive,
                     timestamp_ms,
                 });
-            }
+            });
         }
         Ok(values)
     }
@@ -78,5 +79,70 @@ impl BitmapIndexProcessor for EventBitmapProcessor {
         // upper end. Solve for the smallest tx satisfying that.
         ((bucket_id + 1) * event_bitmap_index::BUCKET_SIZE)
             .div_ceil(event_bitmap_index::MAX_EVENTS_PER_TX as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashSet;
+    use std::sync::Arc;
+
+    use move_core_types::ident_str;
+    use sui_index_dimensions::IndexDimension;
+    use sui_index_dimensions::encode_dimension_key;
+    use sui_types::base_types::ObjectID;
+    use sui_types::event::Event;
+    use sui_types::gas_coin::GAS;
+    use sui_types::test_checkpoint_data_builder::TestCheckpointBuilder;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn preserves_duplicate_dimensions_across_distinct_events() {
+        let checkpoint = TestCheckpointBuilder::new(0)
+            .start_transaction(1)
+            .with_events(vec![
+                Event::new(
+                    &ObjectID::ZERO,
+                    ident_str!("dup_mod"),
+                    TestCheckpointBuilder::derive_address(1),
+                    GAS::type_(),
+                    vec![],
+                ),
+                Event::new(
+                    &ObjectID::ZERO,
+                    ident_str!("dup_mod"),
+                    TestCheckpointBuilder::derive_address(1),
+                    GAS::type_(),
+                    vec![],
+                ),
+            ])
+            .finish_transaction()
+            .build_checkpoint();
+
+        let values = EventBitmapProcessor
+            .process(&Arc::new(checkpoint))
+            .await
+            .unwrap();
+
+        let sender_dim_key = encode_dimension_key(
+            IndexDimension::Sender,
+            TestCheckpointBuilder::derive_address(1).as_ref(),
+        );
+        let sender_row_key = event_bitmap_index::encode_row_key(
+            event_bitmap_index::SCHEMA_VERSION,
+            &sender_dim_key,
+            0,
+        );
+
+        let sender_values: Vec<_> = values
+            .iter()
+            .filter(|v| v.row_key.as_ref() == sender_row_key.as_slice())
+            .collect();
+        let sender_bits: HashSet<_> = sender_values.iter().map(|v| v.bit_position).collect();
+
+        assert_eq!(values.len(), 12);
+        assert_eq!(sender_values.len(), 2);
+        assert_eq!(sender_bits.len(), 2);
     }
 }

@@ -60,10 +60,6 @@ pub struct BitmapIndexValue {
     pub bucket_id: u64,
     pub bit_position: u32,
     pub checkpoint_seq: u64,
-    /// `network_total_transactions` for the checkpoint (exclusive upper
-    /// bound of `tx_seq`s in this checkpoint). Used by the buffer to decide
-    /// when a bucket is sealed.
-    pub tx_hi_exclusive: u64,
     /// Checkpoint wall-clock timestamp (ms). Used as the BigTable cell
     /// version on flush so cumulative re-writes monotonically supersede
     /// earlier ones under `maxversions=1`.
@@ -94,7 +90,7 @@ pub struct BitmapIndexBatch {
 #[derive(Default)]
 struct BatchInner {
     rows: HashMap<Bytes, BatchedRow>,
-    cps: Vec<(u64, u64, u64)>,
+    cps: BTreeMap<u64, u64>,
 }
 
 pub struct BatchedRow {
@@ -106,20 +102,20 @@ pub struct BatchedRow {
 /// Ownership-transfer unit between `commit()` and `flush_through`.
 pub struct BatchMessage {
     pub rows: HashMap<Bytes, BatchedRow>,
-    /// `(cp_seq, tx_hi_exclusive, timestamp_ms)` per value observed.
-    /// Duplicates across values are harmless — they dedupe into a BTreeMap
-    /// on the canonical side.
-    pub cps: Vec<(u64, u64, u64)>,
+    /// `cp_seq -> timestamp_ms` for checkpoints represented in `rows`.
+    pub cps: BTreeMap<u64, u64>,
 }
 
 impl BitmapIndexBatch {
     /// Merge a batch of values into this per-task accumulator.
     pub fn extend(&self, values: impl IntoIterator<Item = BitmapIndexValue>) {
         let mut inner = self.inner.lock().unwrap();
+        let mut last_checkpoint_seq = None;
         for v in values {
-            inner
-                .cps
-                .push((v.checkpoint_seq, v.tx_hi_exclusive, v.timestamp_ms));
+            if last_checkpoint_seq != Some(v.checkpoint_seq) {
+                inner.cps.entry(v.checkpoint_seq).or_insert(v.timestamp_ms);
+                last_checkpoint_seq = Some(v.checkpoint_seq);
+            }
             let row = inner.rows.entry(v.row_key).or_insert(BatchedRow {
                 bucket_id: v.bucket_id,
                 bitmap: RoaringBitmap::new(),
@@ -162,10 +158,9 @@ struct FlushState {
     receiver: mpsc::UnboundedReceiver<BatchMessage>,
     /// Cumulative bits per row. Owned exclusively by the flush thread.
     canonical: HashMap<Bytes, CanonicalRow>,
-    /// `cp_seq -> (tx_hi_exclusive, timestamp_ms)`. Populated as batches
-    /// drain in; looked up at write time to pick each row's cell
-    /// timestamp from its `max_cp`.
-    cps: BTreeMap<u64, (u64, u64)>,
+    /// `cp_seq -> timestamp_ms`. Populated as batches drain in; looked up
+    /// at write time to pick each row's cell timestamp from its `max_cp`.
+    cps: BTreeMap<u64, u64>,
 }
 
 struct CanonicalRow {
@@ -266,7 +261,7 @@ impl BitmapBuffer {
                     row.bitmap
                         .serialize_into(&mut buf)
                         .expect("serialize into Vec is infallible");
-                    let (_, ts_ms) = *cps.get(&row.max_cp).expect("max_cp must exist in cps");
+                    let ts_ms = *cps.get(&row.max_cp).expect("max_cp must exist in cps");
                     tables::make_entry(
                         row_key.clone(),
                         [(self.column, Bytes::from(buf))],
@@ -302,8 +297,8 @@ impl BitmapBuffer {
     /// Creates new canonical rows with `needs_load_from_db` set based on
     /// whether the row's bucket straddles the startup watermark.
     fn merge_into_canonical(&self, state: &mut FlushState, msg: BatchMessage) {
-        for (cp, tx_hi, ts_ms) in msg.cps {
-            state.cps.entry(cp).or_insert((tx_hi, ts_ms));
+        for (cp, ts_ms) in msg.cps {
+            state.cps.entry(cp).or_insert(ts_ms);
         }
         for (row_key, batched) in msg.rows {
             let needs_load_from_db = self.bucket_straddles_startup(batched.bucket_id);
@@ -370,6 +365,7 @@ impl BitmapBuffer {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
     use std::sync::Arc;
 
     use async_trait::async_trait;
@@ -434,9 +430,9 @@ mod tests {
     /// what the handler's `batch()` + `commit()` would produce.
     fn batch_message(values: Vec<BitmapIndexValue>) -> BatchMessage {
         let mut rows: std::collections::HashMap<Bytes, BatchedRow> = Default::default();
-        let mut cps = Vec::new();
+        let mut cps = BTreeMap::new();
         for v in values {
-            cps.push((v.checkpoint_seq, v.tx_hi_exclusive, v.timestamp_ms));
+            cps.entry(v.checkpoint_seq).or_insert(v.timestamp_ms);
             let row = rows.entry(v.row_key).or_insert(BatchedRow {
                 bucket_id: v.bucket_id,
                 bitmap: RoaringBitmap::new(),
@@ -455,7 +451,6 @@ mod tests {
         bucket_id: u64,
         bits: &[u32],
         checkpoint_seq: u64,
-        tx_hi_exclusive: u64,
         timestamp_ms: u64,
     ) -> Vec<BitmapIndexValue> {
         bits.iter()
@@ -464,7 +459,6 @@ mod tests {
                 bucket_id,
                 bit_position,
                 checkpoint_seq,
-                tx_hi_exclusive,
                 timestamp_ms,
             })
             .collect()
@@ -496,14 +490,7 @@ mod tests {
         let mut conn = store.connect().await.unwrap();
 
         let row_key = b"v1#dim#0000000000";
-        buf.send(batch_message(make_values(
-            row_key,
-            0,
-            &[0, 5, 99],
-            0,
-            3,
-            1000,
-        )));
+        buf.send(batch_message(make_values(row_key, 0, &[0, 5, 99], 0, 1000)));
         assert!(read_stored_bitmap(&mock, row_key).await.is_none());
 
         buf.flush_through(conn.client(), &watermark(0, 3, 1000))
@@ -526,8 +513,8 @@ mod tests {
         let mut conn = store.connect().await.unwrap();
 
         let row_key = b"v1#dim#0000000000";
-        buf.send(batch_message(make_values(row_key, 0, &[5], 1, 6, 2000)));
-        buf.send(batch_message(make_values(row_key, 0, &[1], 0, 3, 1000)));
+        buf.send(batch_message(make_values(row_key, 0, &[5], 1, 2000)));
+        buf.send(batch_message(make_values(row_key, 0, &[1], 0, 1000)));
 
         buf.flush_through(conn.client(), &watermark(1, 6, 2000))
             .await
@@ -547,13 +534,13 @@ mod tests {
 
         let row_key = b"v1#dim#0000000000";
 
-        buf.send(batch_message(make_values(row_key, 0, &[10], 0, 3, 1000)));
+        buf.send(batch_message(make_values(row_key, 0, &[10], 0, 1000)));
         buf.flush_through(conn.client(), &watermark(0, 3, 1000))
             .await
             .unwrap();
         assert_eq!(read_stored_bitmap(&mock, row_key).await.unwrap().len(), 1);
 
-        buf.send(batch_message(make_values(row_key, 0, &[20], 1, 6, 2000)));
+        buf.send(batch_message(make_values(row_key, 0, &[20], 1, 2000)));
         buf.flush_through(conn.client(), &watermark(1, 6, 2000))
             .await
             .unwrap();
@@ -571,7 +558,7 @@ mod tests {
         let mut conn = store.connect().await.unwrap();
 
         let row_key = b"v1#dim#0000000000";
-        buf.send(batch_message(make_values(row_key, 0, &[0, 5], 0, 3, 1000)));
+        buf.send(batch_message(make_values(row_key, 0, &[0, 5], 0, 1000)));
 
         buf.flush_through(conn.client(), &watermark(0, 3, 1000))
             .await
@@ -602,7 +589,6 @@ mod tests {
             bucket_id: 0,
             bit_position: (bucket_size - 1) as u32,
             checkpoint_seq: 0,
-            tx_hi_exclusive: tx_hi_excl,
             timestamp_ms: 1000,
         }];
         values.push(BitmapIndexValue {
@@ -610,7 +596,6 @@ mod tests {
             bucket_id: 1,
             bit_position: 0,
             checkpoint_seq: 0,
-            tx_hi_exclusive: tx_hi_excl,
             timestamp_ms: 1000,
         });
 
@@ -667,7 +652,7 @@ mod tests {
             .unwrap();
 
         // Fresh buffer merges new bit 10 from cp 5.
-        buf.send(batch_message(make_values(row_key, 0, &[10], 5, 18, 2000)));
+        buf.send(batch_message(make_values(row_key, 0, &[10], 5, 2000)));
         buf.flush_through(conn.client(), &watermark(5, 18, 2000))
             .await
             .unwrap();
@@ -686,7 +671,7 @@ mod tests {
         let mut conn = store.connect().await.unwrap();
 
         let row_key = b"v1#dim#0000000000";
-        buf.send(batch_message(make_values(row_key, 0, &[7], 5, 18, 2000)));
+        buf.send(batch_message(make_values(row_key, 0, &[7], 5, 2000)));
         buf.flush_through(conn.client(), &watermark(5, 18, 2000))
             .await
             .unwrap();
@@ -725,7 +710,7 @@ mod tests {
             .await
             .unwrap();
 
-        buf.send(batch_message(make_values(row_key, 0, &[10], 5, 18, 2000)));
+        buf.send(batch_message(make_values(row_key, 0, &[10], 5, 2000)));
         buf.flush_through(conn.client(), &watermark(5, 18, 2000))
             .await
             .unwrap();
@@ -746,7 +731,7 @@ mod tests {
             .await
             .unwrap();
 
-        buf.send(batch_message(make_values(row_key, 0, &[20], 6, 20, 4000)));
+        buf.send(batch_message(make_values(row_key, 0, &[20], 6, 4000)));
         buf.flush_through(conn.client(), &watermark(6, 20, 4000))
             .await
             .unwrap();

@@ -20,13 +20,19 @@ pub mod col {
 /// - `dimension_key`: `[tag_byte][value_bytes]` from `sui-index-dimensions`
 /// - `bucket_id`: `checkpoint_seq / bucket_size`, zero-padded to 10 digits
 pub fn encode_row_key(version: u32, dimension_key: &[u8], bucket_id: u64) -> Vec<u8> {
+    let mut key = Vec::new();
+    encode_row_key_into(&mut key, version, dimension_key, bucket_id);
+    key
+}
+
+pub fn encode_row_key_into(out: &mut Vec<u8>, version: u32, dimension_key: &[u8], bucket_id: u64) {
     let prefix = format!("v{version}#");
     let suffix = format!("#{bucket_id:010}");
-    let mut key = Vec::with_capacity(prefix.len() + dimension_key.len() + suffix.len());
-    key.extend_from_slice(prefix.as_bytes());
-    key.extend_from_slice(dimension_key);
-    key.extend_from_slice(suffix.as_bytes());
-    key
+    out.clear();
+    out.reserve(prefix.len() + dimension_key.len() + suffix.len());
+    out.extend_from_slice(prefix.as_bytes());
+    out.extend_from_slice(dimension_key);
+    out.extend_from_slice(suffix.as_bytes());
 }
 
 #[cfg(test)]
