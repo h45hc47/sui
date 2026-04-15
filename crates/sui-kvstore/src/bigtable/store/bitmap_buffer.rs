@@ -45,6 +45,8 @@ use std::sync::Mutex;
 
 use anyhow::Context;
 use bytes::Bytes;
+use futures::StreamExt;
+use futures::stream;
 use roaring::RoaringBitmap;
 use sui_indexer_alt_framework::pipeline::Processor;
 use sui_indexer_alt_framework_store_traits::CommitterWatermark;
@@ -54,6 +56,9 @@ use tracing::error;
 
 use crate::bigtable::client::BigTableClient;
 use crate::tables;
+
+const PRE_RESTART_LOAD_CHUNK_SIZE: usize = 100;
+const PRE_RESTART_LOAD_CONCURRENCY: usize = 10;
 
 /// One bit to set in a bitmap-index row, plus the checkpoint metadata the
 /// buffer needs to determine cell timestamps and seal-for-eviction conditions.
@@ -344,44 +349,77 @@ impl BitmapBuffer {
             "Loading pre-restart bitmap rows from BigTable",
         );
 
-        let mut db_bitmaps: HashMap<Bytes, RoaringBitmap> = HashMap::new();
-        let fetched = match client.multi_get(self.table, need_load, None).await {
-            Ok(fetched) => fetched,
-            Err(e) => {
-                error!(
-                    table = self.table,
-                    rows = need_load_len,
-                    error = %e,
-                    error_debug = ?e,
-                    "Failed loading pre-restart bitmap rows from BigTable",
-                );
-                return Err(e).context("loading pre-existing bitmap rows from BigTable");
+        let chunk_count = need_load_len.div_ceil(PRE_RESTART_LOAD_CHUNK_SIZE);
+        let mut fetched_rows = 0usize;
+        let chunked_keys = need_load
+            .chunks(PRE_RESTART_LOAD_CHUNK_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let mut chunks = stream::iter(chunked_keys)
+            .map(|chunk| {
+                let mut client = client.clone();
+                async move {
+                    let chunk_len = chunk.len();
+                    let fetched = client.multi_get(self.table, chunk.clone(), None).await;
+                    (chunk_len, chunk, fetched)
+                }
+            })
+            .buffer_unordered(PRE_RESTART_LOAD_CONCURRENCY);
+
+        while let Some((chunk_len, attempted_keys, fetched)) = chunks.next().await {
+            let fetched = match fetched {
+                Ok(fetched) => fetched,
+                Err(e) => {
+                    error!(
+                        table = self.table,
+                        rows = need_load_len,
+                        chunk_rows = chunk_len,
+                        chunk_size = PRE_RESTART_LOAD_CHUNK_SIZE,
+                        chunk_concurrency = PRE_RESTART_LOAD_CONCURRENCY,
+                        error = %e,
+                        error_debug = ?e,
+                        "Failed loading pre-restart bitmap rows from BigTable",
+                    );
+                    return Err(e).context("loading pre-existing bitmap rows from BigTable");
+                }
+            };
+
+            fetched_rows += fetched.len();
+
+            let mut db_bitmaps: HashMap<Bytes, RoaringBitmap> = HashMap::new();
+            for (row_key, cells) in fetched {
+                for (col, val) in cells {
+                    if col.as_ref() == self.column.as_bytes() {
+                        let bm = RoaringBitmap::deserialize_from(val.as_ref())
+                            .context("deserializing existing bitmap from BigTable")?;
+                        db_bitmaps.insert(row_key.clone(), bm);
+                        break;
+                    }
+                }
             }
-        };
-        debug!(
-            table = self.table,
-            rows = need_load_len,
-            fetched = fetched.len(),
-            "Loaded pre-restart bitmap rows from BigTable",
-        );
-        for (row_key, cells) in fetched {
-            for (col, val) in cells {
-                if col.as_ref() == self.column.as_bytes() {
-                    let bm = RoaringBitmap::deserialize_from(val.as_ref())
-                        .context("deserializing existing bitmap from BigTable")?;
-                    db_bitmaps.insert(row_key, bm);
-                    break;
+
+            let mut state = self.flush_state.lock().unwrap();
+            for attempted in attempted_keys {
+                if let Some(row) = state.canonical.get_mut(attempted.as_slice()) {
+                    row.needs_load_from_db = false;
+                }
+            }
+            for (row_key, db_bm) in db_bitmaps {
+                if let Some(row) = state.canonical.get_mut(&row_key) {
+                    row.bitmap |= db_bm;
                 }
             }
         }
 
-        let mut state = self.flush_state.lock().unwrap();
-        for (row_key, db_bm) in db_bitmaps {
-            if let Some(row) = state.canonical.get_mut(&row_key) {
-                row.bitmap |= db_bm;
-                row.needs_load_from_db = false;
-            }
-        }
+        debug!(
+            table = self.table,
+            rows = need_load_len,
+            chunks = chunk_count,
+            fetched = fetched_rows,
+            chunk_size = PRE_RESTART_LOAD_CHUNK_SIZE,
+            chunk_concurrency = PRE_RESTART_LOAD_CONCURRENCY,
+            "Loaded pre-restart bitmap rows from BigTable",
+        );
 
         Ok(())
     }
