@@ -654,7 +654,9 @@ impl ConsensusAdapter {
     ) -> SuiResult<JoinHandle<()>> {
         // Observer nodes should not submit transactions to consensus
         if epoch_store.is_observer() {
-            return Err(SuiError::from("Observer nodes cannot submit transactions to consensus"));
+            return Err(SuiError::from(
+                "Observer nodes cannot submit transactions to consensus",
+            ));
         }
 
         if transactions.len() > 1 {

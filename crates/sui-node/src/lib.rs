@@ -1432,7 +1432,7 @@ impl SuiNode {
         checkpoint_metrics: Arc<CheckpointMetrics>,
         sui_node_metrics: Arc<SuiNodeMetrics>,
         sui_tx_validator_metrics: Arc<SuiTxValidatorMetrics>,
-        _is_validator: bool,
+        is_validator: bool,
     ) -> Result<ValidatorComponents> {
         let checkpoint_service = Self::build_checkpoint_service(
             config,
@@ -1453,11 +1453,18 @@ impl SuiNode {
         consensus_adapter.swap_low_scoring_authorities(low_scoring_authorities.clone());
 
         if epoch_store.randomness_state_enabled() {
+            // Pass authority keys only for validators, not for observers
+            let authority_key_pair = if is_validator {
+                Some(config.protocol_key_pair())
+            } else {
+                None
+            };
+
             let randomness_manager = RandomnessManager::try_new(
                 Arc::downgrade(&epoch_store),
                 Box::new(consensus_adapter.clone()),
                 randomness_handle,
-                config.protocol_key_pair(),
+                authority_key_pair,
             )
             .await;
             if let Some(randomness_manager) = randomness_manager {
