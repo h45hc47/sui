@@ -29,6 +29,7 @@ use move_command_line_common::display::RenderResult;
 use move_command_line_common::display::try_render_constant;
 use move_command_line_common::error_bitset::ErrorBitset;
 use move_core_types::account_address::AccountAddress;
+use move_core_types::annotated_value as A;
 use move_core_types::annotated_value::MoveEnumLayout;
 use move_core_types::annotated_value::MoveFieldLayout;
 use move_core_types::annotated_value::MoveStructLayout;
@@ -37,11 +38,13 @@ use move_core_types::language_storage::ModuleId;
 use move_core_types::language_storage::StructTag;
 use move_core_types::language_storage::TypeTag;
 use sui_types::Identifier;
+use sui_types::base_types::ObjectID;
 use sui_types::base_types::SequenceNumber;
 use sui_types::base_types::is_primitive_type_tag;
 use sui_types::move_package::MovePackage;
 use sui_types::move_package::TypeOrigin;
 use sui_types::object::Object;
+use sui_types::storage::BackingPackageStore;
 use sui_types::transaction::Argument;
 use sui_types::transaction::CallArg;
 use sui_types::transaction::Command;
@@ -63,6 +66,15 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// `package_store` to load packages and then type definitions from those packages.
 #[derive(Debug)]
 pub struct Resolver<S> {
+    package_store: S,
+    limits: Option<Limits>,
+}
+
+/// Synchronous sibling of [`Resolver`], driven by a [`SyncPackageStore`]. Shares every piece of
+/// resolution logic with [`Resolver`] via the `define_resolver!` macro — the only real
+/// difference is how packages are fetched.
+#[derive(Debug)]
+pub struct SyncResolver<S> {
     package_store: S,
     limits: Option<Limits>,
 }
@@ -305,10 +317,17 @@ struct ResolutionContext<'l> {
 /// Interface to abstract over access to a store of live packages.  Used to override the default
 /// store during testing.
 #[async_trait]
-pub trait PackageStore: Send + Sync + 'static {
+pub trait PackageStore: Send + Sync {
     /// Read package contents. Fails if `id` is not an object, not a package, or is malformed in
     /// some way.
     async fn fetch(&self, id: AccountAddress) -> Result<Arc<Package>>;
+}
+
+/// Synchronous analogue of [`PackageStore`], used by [`SyncResolver`] when the backing storage
+/// layer is itself synchronous (e.g. the validator/authority `BackingPackageStore`). No
+/// `Send`/`Sync`/`'static` bounds so implementations can borrow freely.
+pub trait SyncPackageStore {
+    fn fetch(&self, id: AccountAddress) -> Result<Arc<Package>>;
 }
 
 macro_rules! as_ref_impl {
@@ -332,6 +351,20 @@ impl<S: PackageStore> PackageStore for Arc<S> {
     }
 }
 
+impl<S: BackingPackageStore> SyncPackageStore for S {
+    fn fetch(&self, id: AccountAddress) -> Result<Arc<Package>> {
+        let object_id = ObjectID::from(id);
+        let package_obj = self
+            .get_package_object(&object_id)
+            .map_err(|e| Error::Store {
+                store: "BackingPackageStore",
+                error: e.to_string(),
+            })?
+            .ok_or(Error::PackageNotFound(id))?;
+        Ok(Arc::new(Package::read_from_object(package_obj.object())?))
+    }
+}
+
 /// Check $value does not exceed $limit in config, if the limit config exists, returning an error
 /// containing the max value and actual value otherwise.
 macro_rules! check_max_limit {
@@ -346,294 +379,559 @@ macro_rules! check_max_limit {
     };
 }
 
-impl<S> Resolver<S> {
-    pub fn new(package_store: S) -> Self {
-        Self {
-            package_store,
-            limits: None,
-        }
-    }
-
-    pub fn new_with_limits(package_store: S, limits: Limits) -> Self {
-        Self {
-            package_store,
-            limits: Some(limits),
-        }
-    }
-
-    pub fn package_store(&self) -> &S {
-        &self.package_store
-    }
-
-    pub fn package_store_mut(&mut self) -> &mut S {
-        &mut self.package_store
-    }
-}
-
-impl<S: PackageStore> Resolver<S> {
-    /// The canonical form of a type refers to each type in terms of its defining package ID. This
-    /// function takes a non-canonical type and updates all its package IDs to the appropriate
-    /// defining ID.
-    ///
-    /// For every `package::module::datatype` in the input `tag`, `package` must be an object
-    /// on-chain, containing a move package that includes `module`, and that module must define the
-    /// `datatype`. In practice this means the input type `tag` can refer to types at or after
-    /// their defining IDs.
-    pub async fn canonical_type(&self, mut tag: TypeTag) -> Result<TypeTag> {
-        let mut context = ResolutionContext::new(self.limits.as_ref());
-
-        // (1). Fetch all the information from this store that is necessary to relocate package IDs
-        // in the type.
-        context
-            .add_type_tag(
-                &mut tag,
-                &self.package_store,
-                /* visit_fields */ false,
-                /* visit_phantoms */ true,
-            )
-            .await?;
-
-        // (2). Use that information to relocate package IDs in the type.
-        context.canonicalize_type(&mut tag)?;
-        Ok(tag)
-    }
-
-    /// Return the type layout corresponding to the given type tag.  The layout always refers to
-    /// structs in terms of their defining ID (i.e. their package ID always points to the first
-    /// package that introduced them).
-    pub async fn type_layout(&self, mut tag: TypeTag) -> Result<MoveTypeLayout> {
-        let mut context = ResolutionContext::new(self.limits.as_ref());
-
-        // (1). Fetch all the information from this store that is necessary to resolve types
-        // referenced by this tag.
-        context
-            .add_type_tag(
-                &mut tag,
-                &self.package_store,
-                /* visit_fields */ true,
-                /* visit_phantoms */ true,
-            )
-            .await?;
-
-        // (2). Use that information to resolve the tag into a layout.
-        let max_depth = self
-            .limits
-            .as_ref()
-            .map_or(usize::MAX, |l| l.max_move_value_depth);
-
-        Ok(context.resolve_type_layout(&tag, max_depth)?.0)
-    }
-
-    /// Return the abilities of a concrete type, based on the abilities in its type definition, and
-    /// the abilities of its concrete type parameters: An instance of a generic type has `store`,
-    /// `copy, or `drop` if its definition has the ability, and all its non-phantom type parameters
-    /// have the ability as well. Similar rules apply for `key` except that it requires its type
-    /// parameters to have `store`.
-    pub async fn abilities(&self, mut tag: TypeTag) -> Result<AbilitySet> {
-        let mut context = ResolutionContext::new(self.limits.as_ref());
-
-        // (1). Fetch all the information from this store that is necessary to resolve types
-        // referenced by this tag.
-        context
-            .add_type_tag(
-                &mut tag,
-                &self.package_store,
-                /* visit_fields */ false,
-                /* visit_phantoms */ false,
-            )
-            .await?;
-
-        // (2). Use that information to calculate the type's abilities.
-        context.resolve_abilities(&tag)
-    }
-
-    /// Returns the signatures of parameters to function `pkg::module::function` in the package
-    /// store, assuming the function exists.
-    pub async fn function_signature(
-        &self,
-        pkg: AccountAddress,
-        module: &str,
-        function: &str,
-    ) -> Result<FunctionDef> {
-        let mut context = ResolutionContext::new(self.limits.as_ref());
-
-        let package = self.package_store.fetch(pkg).await?;
-        let Some(mut def) = package.module(module)?.function_def(function)? else {
-            return Err(Error::FunctionNotFound(
-                pkg,
-                module.to_string(),
-                function.to_string(),
-            ));
-        };
-
-        // (1). Fetch all the information from this store that is necessary to resolve types
-        // referenced by this tag.
-        for sig in def.parameters.iter().chain(def.return_.iter()) {
-            context
-                .add_signature(
-                    sig.body.clone(),
-                    &self.package_store,
-                    package.as_ref(),
-                    /* visit_fields */ false,
-                )
-                .await?;
-        }
-
-        // (2). Use that information to relocate package IDs in the signature.
-        for sig in def.parameters.iter_mut().chain(def.return_.iter_mut()) {
-            context.relocate_signature(&mut sig.body)?;
-        }
-
-        Ok(def)
-    }
-
-    /// Attempts to infer the type layouts for pure inputs to the programmable transaction.
-    ///
-    /// The returned vector contains an element for each input to `tx`. Elements corresponding to
-    /// pure inputs that are used as arguments to transaction commands will contain `Some(layout)`.
-    /// Elements for other inputs (non-pure inputs, and unused pure inputs) will be `None`.
-    ///
-    /// Layout resolution can fail if a type/module/package doesn't exist, if layout resolution hits
-    /// a limit, or if a pure input is somehow used in multiple conflicting occasions (with
-    /// different types).
-    pub async fn pure_input_layouts(
-        &self,
-        tx: &ProgrammableTransaction,
-    ) -> Result<Vec<Option<MoveTypeLayout>>> {
-        let mut tags = vec![None; tx.inputs.len()];
-        let mut register_type = |arg: &Argument, tag: &TypeTag| {
-            let &Argument::Input(ix) = arg else {
-                return;
-            };
-
-            if !matches!(tx.inputs.get(ix as usize), Some(CallArg::Pure(_))) {
-                return;
-            }
-
-            let Some(type_) = tags.get_mut(ix as usize) else {
-                return;
-            };
-
-            // Types are initially `None`, and are set to `Some(Ok(_))` as long as the input can be
-            // mapped to a unique type, and to `Some(Err(()))` if the input is used with
-            // conflicting types at some point.
-            match type_ {
-                None => *type_ = Some(Ok(tag.clone())),
-                Some(Err(())) => {}
-                Some(Ok(prev)) => {
-                    if prev != tag {
-                        *type_ = Some(Err(()));
-                    }
+/// Generates the inherent methods, the `$store_trait`-bounded public methods, and the
+/// fetch-interleaved `$add_tag` / `$add_sig` helpers (as methods on `ResolutionContext`) for a
+/// resolver type. Invoked once for the async `Resolver` (over `PackageStore`) and once for the
+/// sync `SyncResolver` (over `SyncPackageStore`).
+///
+/// The body is the existing pre-macro source, with only the following tokens parameterized:
+///
+/// * `$resolver` — the resolver type name.
+/// * `$store_trait` — the store trait bound.
+/// * `$add_tag` / `$add_sig` — unique names for the per-mode `ResolutionContext` helpers.
+/// * `$($async)*` — expands to the `async` keyword, or nothing.
+/// * `$($await)*` — expands to `.await`, or nothing.
+macro_rules! define_resolver {
+    (
+        resolver: $resolver:ident,
+        store_trait: $store_trait:ident,
+        add_type_tag: $add_tag:ident,
+        add_signature: $add_sig:ident,
+        async: {$($async:tt)*},
+        await: {$($await:tt)*} $(,)?
+    ) => {
+        impl<S> $resolver<S> {
+            pub fn new(package_store: S) -> Self {
+                Self {
+                    package_store,
+                    limits: None,
                 }
             }
-        };
 
-        // (1). Infer type tags for pure inputs from their uses.
-        for cmd in &tx.commands {
-            match cmd {
-                Command::MoveCall(call) => {
-                    let params = self
-                        .function_signature(
-                            call.package.into(),
-                            call.module.as_str(),
-                            call.function.as_str(),
+            pub fn new_with_limits(package_store: S, limits: Limits) -> Self {
+                Self {
+                    package_store,
+                    limits: Some(limits),
+                }
+            }
+
+            pub fn package_store(&self) -> &S {
+                &self.package_store
+            }
+
+            pub fn package_store_mut(&mut self) -> &mut S {
+                &mut self.package_store
+            }
+        }
+
+        impl<S: $store_trait> $resolver<S> {
+            /// The canonical form of a type refers to each type in terms of its defining package ID. This
+            /// function takes a non-canonical type and updates all its package IDs to the appropriate
+            /// defining ID.
+            ///
+            /// For every `package::module::datatype` in the input `tag`, `package` must be an object
+            /// on-chain, containing a move package that includes `module`, and that module must define the
+            /// `datatype`. In practice this means the input type `tag` can refer to types at or after
+            /// their defining IDs.
+            pub $($async)* fn canonical_type(&self, mut tag: TypeTag) -> Result<TypeTag> {
+                let mut context = ResolutionContext::new(self.limits.as_ref());
+
+                // (1). Fetch all the information from this store that is necessary to relocate package IDs
+                // in the type.
+                context
+                    .$add_tag(
+                        &mut tag,
+                        &self.package_store,
+                        /* visit_fields */ false,
+                        /* visit_phantoms */ true,
+                    )
+                    $($await)* ?;
+
+                // (2). Use that information to relocate package IDs in the type.
+                context.canonicalize_type(&mut tag)?;
+                Ok(tag)
+            }
+
+            /// Return the type layout corresponding to the given type tag.  The layout always refers to
+            /// structs in terms of their defining ID (i.e. their package ID always points to the first
+            /// package that introduced them).
+            pub $($async)* fn type_layout(&self, mut tag: TypeTag) -> Result<MoveTypeLayout> {
+                let mut context = ResolutionContext::new(self.limits.as_ref());
+
+                // (1). Fetch all the information from this store that is necessary to resolve types
+                // referenced by this tag.
+                context
+                    .$add_tag(
+                        &mut tag,
+                        &self.package_store,
+                        /* visit_fields */ true,
+                        /* visit_phantoms */ true,
+                    )
+                    $($await)* ?;
+
+                // (2). Use that information to resolve the tag into a layout.
+                let max_depth = self
+                    .limits
+                    .as_ref()
+                    .map_or(usize::MAX, |l| l.max_move_value_depth);
+
+                Ok(context.resolve_type_layout(&tag, max_depth)?.0)
+            }
+
+            /// Return the datatype layout (struct or enum) corresponding to the given struct tag. This is a
+            /// convenience wrapper around [`Self::type_layout`] that mirrors the signature of the legacy
+            /// `LayoutResolver::get_annotated_layout` method for easier migration.
+            pub $($async)* fn datatype_layout(
+                &self,
+                struct_tag: &StructTag,
+            ) -> Result<A::MoveDatatypeLayout> {
+                let type_tag = TypeTag::Struct(Box::new(struct_tag.clone()));
+                let layout = self.type_layout(type_tag) $($await)* ?;
+                match layout {
+                    MoveTypeLayout::Struct(s) => Ok(A::MoveDatatypeLayout::Struct(s)),
+                    MoveTypeLayout::Enum(e) => Ok(A::MoveDatatypeLayout::Enum(e)),
+                    _ => unreachable!("StructTag always resolves to a struct or enum layout"),
+                }
+            }
+
+            /// Return the abilities of a concrete type, based on the abilities in its type definition, and
+            /// the abilities of its concrete type parameters: An instance of a generic type has `store`,
+            /// `copy, or `drop` if its definition has the ability, and all its non-phantom type parameters
+            /// have the ability as well. Similar rules apply for `key` except that it requires its type
+            /// parameters to have `store`.
+            pub $($async)* fn abilities(&self, mut tag: TypeTag) -> Result<AbilitySet> {
+                let mut context = ResolutionContext::new(self.limits.as_ref());
+
+                // (1). Fetch all the information from this store that is necessary to resolve types
+                // referenced by this tag.
+                context
+                    .$add_tag(
+                        &mut tag,
+                        &self.package_store,
+                        /* visit_fields */ false,
+                        /* visit_phantoms */ false,
+                    )
+                    $($await)* ?;
+
+                // (2). Use that information to calculate the type's abilities.
+                context.resolve_abilities(&tag)
+            }
+
+            /// Returns the signatures of parameters to function `pkg::module::function` in the package
+            /// store, assuming the function exists.
+            pub $($async)* fn function_signature(
+                &self,
+                pkg: AccountAddress,
+                module: &str,
+                function: &str,
+            ) -> Result<FunctionDef> {
+                let mut context = ResolutionContext::new(self.limits.as_ref());
+
+                let package = self.package_store.fetch(pkg) $($await)* ?;
+                let Some(mut def) = package.module(module)?.function_def(function)? else {
+                    return Err(Error::FunctionNotFound(
+                        pkg,
+                        module.to_string(),
+                        function.to_string(),
+                    ));
+                };
+
+                // (1). Fetch all the information from this store that is necessary to resolve types
+                // referenced by this tag.
+                for sig in def.parameters.iter().chain(def.return_.iter()) {
+                    context
+                        .$add_sig(
+                            sig.body.clone(),
+                            &self.package_store,
+                            package.as_ref(),
+                            /* visit_fields */ false,
                         )
-                        .await?
-                        .parameters;
+                        $($await)* ?;
+                }
 
-                    #[allow(clippy::disallowed_methods)]
-                    // Intentional zip: params includes implicit TxContext param not in arguments
-                    for (open_sig, arg) in params.iter().zip(call.arguments.iter()) {
-                        let sig = open_sig.instantiate(&call.type_arguments)?;
-                        register_type(arg, &sig.body);
+                // (2). Use that information to relocate package IDs in the signature.
+                for sig in def.parameters.iter_mut().chain(def.return_.iter_mut()) {
+                    context.relocate_signature(&mut sig.body)?;
+                }
+
+                Ok(def)
+            }
+
+            /// Attempts to infer the type layouts for pure inputs to the programmable transaction.
+            ///
+            /// The returned vector contains an element for each input to `tx`. Elements corresponding to
+            /// pure inputs that are used as arguments to transaction commands will contain `Some(layout)`.
+            /// Elements for other inputs (non-pure inputs, and unused pure inputs) will be `None`.
+            ///
+            /// Layout resolution can fail if a type/module/package doesn't exist, if layout resolution hits
+            /// a limit, or if a pure input is somehow used in multiple conflicting occasions (with
+            /// different types).
+            pub $($async)* fn pure_input_layouts(
+                &self,
+                tx: &ProgrammableTransaction,
+            ) -> Result<Vec<Option<MoveTypeLayout>>> {
+                let mut tags = vec![None; tx.inputs.len()];
+                let mut register_type = |arg: &Argument, tag: &TypeTag| {
+                    let &Argument::Input(ix) = arg else {
+                        return;
+                    };
+
+                    if !matches!(tx.inputs.get(ix as usize), Some(CallArg::Pure(_))) {
+                        return;
+                    }
+
+                    let Some(type_) = tags.get_mut(ix as usize) else {
+                        return;
+                    };
+
+                    // Types are initially `None`, and are set to `Some(Ok(_))` as long as the input can be
+                    // mapped to a unique type, and to `Some(Err(()))` if the input is used with
+                    // conflicting types at some point.
+                    match type_ {
+                        None => *type_ = Some(Ok(tag.clone())),
+                        Some(Err(())) => {}
+                        Some(Ok(prev)) => {
+                            if prev != tag {
+                                *type_ = Some(Err(()));
+                            }
+                        }
+                    }
+                };
+
+                // (1). Infer type tags for pure inputs from their uses.
+                for cmd in &tx.commands {
+                    match cmd {
+                        Command::MoveCall(call) => {
+                            let params = self
+                                .function_signature(
+                                    call.package.into(),
+                                    call.module.as_str(),
+                                    call.function.as_str(),
+                                )
+                                $($await)* ?
+                                .parameters;
+
+                            #[allow(clippy::disallowed_methods)]
+                            // Intentional zip: params includes implicit TxContext param not in arguments
+                            for (open_sig, arg) in params.iter().zip(call.arguments.iter()) {
+                                let sig = open_sig.instantiate(&call.type_arguments)?;
+                                register_type(arg, &sig.body);
+                            }
+                        }
+
+                        Command::TransferObjects(_, arg) => register_type(arg, &TypeTag::Address),
+
+                        Command::SplitCoins(_, amounts) => {
+                            for amount in amounts {
+                                register_type(amount, &TypeTag::U64);
+                            }
+                        }
+
+                        Command::MakeMoveVec(Some(tag), elems) => {
+                            let tag = as_type_tag(tag)?;
+                            if is_primitive_type_tag(&tag) {
+                                for elem in elems {
+                                    register_type(elem, &tag);
+                                }
+                            }
+                        }
+
+                        _ => { /* nop */ }
                     }
                 }
 
-                Command::TransferObjects(_, arg) => register_type(arg, &TypeTag::Address),
+                // (2). Gather all the unique type tags to convert into layouts. There are relatively few
+                // primitive types so this is worth doing to avoid redundant work.
+                let unique_tags: BTreeSet<_> = tags
+                    .iter()
+                    .flat_map(|t| t.clone())
+                    .flat_map(|t| t.ok())
+                    .collect();
 
-                Command::SplitCoins(_, amounts) => {
-                    for amount in amounts {
-                        register_type(amount, &TypeTag::U64);
-                    }
+                // (3). Convert the type tags into layouts.
+                let mut layouts = BTreeMap::new();
+                for tag in unique_tags {
+                    let layout = self.type_layout(tag.clone()) $($await)* ?;
+                    layouts.insert(tag, layout);
                 }
 
-                Command::MakeMoveVec(Some(tag), elems) => {
-                    let tag = as_type_tag(tag)?;
-                    if is_primitive_type_tag(&tag) {
-                        for elem in elems {
-                            register_type(elem, &tag);
+                // (4) Prepare the result vector.
+                Ok(tags
+                    .iter()
+                    .map(|t| -> Option<_> {
+                        let t = t.as_ref()?;
+                        let t = t.as_ref().ok()?;
+                        layouts.get(t).cloned()
+                    })
+                    .collect())
+            }
+
+            /// Resolves a runtime address in a `ModuleId` to a storage `ModuleId` according to the linkage
+            /// table in the `context` which must refer to a package.
+            /// * Will fail if the wrong context is provided, i.e., is not a package, or
+            ///   does not exist.
+            /// * Will fail if an invalid `context` is provided for the `location`, i.e., the package at
+            ///   `context` does not contain the module that `location` refers to.
+            pub $($async)* fn resolve_module_id(
+                &self,
+                module_id: ModuleId,
+                context: AccountAddress,
+            ) -> Result<ModuleId> {
+                let package = self.package_store.fetch(context) $($await)* ?;
+                let storage_id = package.relocate(*module_id.address())?;
+                Ok(ModuleId::new(storage_id, module_id.name().to_owned()))
+            }
+
+            /// Resolves an abort code following the clever error format to a `CleverError` enum.
+            /// The `module_id` must be the storage ID of the module (which can e.g., be gotten from the
+            /// `resolve_module_id` function) and not the runtime ID.
+            ///
+            /// If the `abort_code` is not a clever error (i.e., does not follow the tagging and layout as
+            /// defined in `ErrorBitset`), this function will return `None`.
+            ///
+            /// In the case where it is a clever error but only a line number is present (i.e., the error
+            /// is the result of an `assert!(<cond>)` source expression) a `CleverError::LineNumberOnly` is
+            /// returned. Otherwise a `CleverError::CompleteError` is returned.
+            ///
+            /// If for any reason we are unable to resolve the abort code to a `CleverError`, this function
+            /// will return `None`.
+            pub $($async)* fn resolve_clever_error(
+                &self,
+                module_id: ModuleId,
+                abort_code: u64,
+            ) -> Option<CleverError> {
+                let _bitset = ErrorBitset::from_u64(abort_code)?;
+                let package = self.package_store.fetch(*module_id.address()) $($await)* .ok()?;
+                package.resolve_clever_error(module_id.name().as_str(), abort_code)
+            }
+        }
+
+        impl<'l> ResolutionContext<'l> {
+            /// Gather definitions for types that contribute to the definition of `tag` into this resolution
+            /// context, fetching data from the `store` as necessary. Also updates package addresses in
+            /// `tag` to point to runtime IDs instead of storage IDs to ensure queries made using these
+            /// addresses during the subsequent resolution phase find the relevant type information in the
+            /// context.
+            ///
+            /// The `visit_fields` flag controls whether the traversal looks inside types at their fields
+            /// (which is necessary for layout resolution) or not (only explores the outer type and any type
+            /// parameters).
+            ///
+            /// The `visit_phantoms` flag controls whether the traversal recurses through phantom type
+            /// parameters (which is also necessary for type resolution) or not.
+            $($async)* fn $add_tag<S: $store_trait + ?Sized>(
+                &mut self,
+                tag: &mut TypeTag,
+                store: &S,
+                visit_fields: bool,
+                visit_phantoms: bool,
+            ) -> Result<()> {
+                use TypeTag as T;
+
+                struct ToVisit<'t> {
+                    tag: &'t mut TypeTag,
+                    depth: usize,
+                }
+
+                let mut frontier = vec![ToVisit { tag, depth: 0 }];
+                while let Some(ToVisit { tag, depth }) = frontier.pop() {
+                    macro_rules! push_ty_param {
+                        ($tag:expr) => {{
+                            check_max_limit!(
+                                TypeParamNesting, self.limits;
+                                max_type_argument_depth > depth
+                            );
+
+                            frontier.push(ToVisit { tag: $tag, depth: depth + 1 })
+                        }}
+                    }
+
+                    match tag {
+                        T::Address
+                        | T::Bool
+                        | T::U8
+                        | T::U16
+                        | T::U32
+                        | T::U64
+                        | T::U128
+                        | T::U256
+                        | T::Signer => {
+                            // Nothing further to add to context
+                        }
+
+                        T::Vector(tag) => push_ty_param!(tag),
+
+                        T::Struct(s) => {
+                            let context = store.fetch(s.address) $($await)* ?;
+                            let def = context
+                                .clone()
+                                .data_def(s.module.as_str(), s.name.as_str())?;
+
+                            // Normalize `address` (the ID of a package that contains the definition of this
+                            // struct) to be a runtime ID, because that's what the resolution context uses
+                            // for keys.  Take care to do this before generating the key that is used to
+                            // query and/or write into `self.structs.
+                            s.address = context.runtime_id;
+                            let key = DatatypeRef::from(s.as_ref()).as_key();
+
+                            if def.type_params.len() != s.type_params.len() {
+                                return Err(Error::TypeArityMismatch(
+                                    def.type_params.len(),
+                                    s.type_params.len(),
+                                ));
+                            }
+
+                            check_max_limit!(
+                                TooManyTypeParams, self.limits;
+                                max_type_argument_width >= s.type_params.len()
+                            );
+
+                            for (param, def) in s.type_params.iter_mut().zip_eq(def.type_params.iter()) {
+                                if !def.is_phantom || visit_phantoms {
+                                    push_ty_param!(param);
+                                }
+                            }
+
+                            if self.datatypes.contains_key(&key) {
+                                continue;
+                            }
+
+                            if visit_fields {
+                                match &def.data {
+                                    MoveData::Struct(fields) => {
+                                        for (_, sig) in fields {
+                                            self.$add_sig(sig.clone(), store, &context, visit_fields)
+                                                $($await)* ?;
+                                        }
+                                    }
+                                    MoveData::Enum(variants) => {
+                                        for variant in variants {
+                                            for (_, sig) in &variant.signatures {
+                                                self.$add_sig(
+                                                    sig.clone(),
+                                                    store,
+                                                    &context,
+                                                    visit_fields,
+                                                )
+                                                $($await)* ?;
+                                            }
+                                        }
+                                    }
+                                };
+                            }
+
+                            check_max_limit!(
+                                TooManyTypeNodes, self.limits;
+                                max_type_nodes > self.datatypes.len()
+                            );
+
+                            self.datatypes.insert(key, def);
                         }
                     }
                 }
 
-                _ => { /* nop */ }
+                Ok(())
+            }
+
+            // Like `$add_tag` but for type signatures.  Needs a linkage table to translate runtime IDs
+            // into storage IDs.
+            $($async)* fn $add_sig<T: $store_trait + ?Sized>(
+                &mut self,
+                sig: OpenSignatureBody,
+                store: &T,
+                context: &Package,
+                visit_fields: bool,
+            ) -> Result<()> {
+                use OpenSignatureBody as O;
+
+                let mut frontier = vec![sig];
+                while let Some(sig) = frontier.pop() {
+                    match sig {
+                        O::Address
+                        | O::Bool
+                        | O::U8
+                        | O::U16
+                        | O::U32
+                        | O::U64
+                        | O::U128
+                        | O::U256
+                        | O::TypeParameter(_) => {
+                            // Nothing further to add to context
+                        }
+
+                        O::Vector(sig) => frontier.push(*sig),
+
+                        O::Datatype(key, params) => {
+                            check_max_limit!(
+                                TooManyTypeParams, self.limits;
+                                max_type_argument_width >= params.len()
+                            );
+
+                            let params_count = params.len();
+                            let data_count = self.datatypes.len();
+                            frontier.extend(params.into_iter());
+
+                            let type_params = if let Some(def) = self.datatypes.get(&key) {
+                                &def.type_params
+                            } else {
+                                check_max_limit!(
+                                    TooManyTypeNodes, self.limits;
+                                    max_type_nodes > data_count
+                                );
+
+                                // Need to resolve the datatype, so fetch the package that contains it.
+                                let storage_id = context.relocate(key.package)?;
+                                let package = store.fetch(storage_id) $($await)* ?;
+
+                                let def = package.data_def(&key.module, &key.name)?;
+                                if visit_fields {
+                                    match &def.data {
+                                        MoveData::Struct(fields) => {
+                                            frontier.extend(fields.iter().map(|f| &f.1).cloned());
+                                        }
+                                        MoveData::Enum(variants) => {
+                                            frontier.extend(
+                                                variants
+                                                    .iter()
+                                                    .flat_map(|v| v.signatures.iter().map(|(_, s)| s))
+                                                    .cloned(),
+                                            );
+                                        }
+                                    };
+                                }
+
+                                &self.datatypes.entry(key).or_insert(def).type_params
+                            };
+
+                            if type_params.len() != params_count {
+                                return Err(Error::TypeArityMismatch(type_params.len(), params_count));
+                            }
+                        }
+                    }
+                }
+
+                Ok(())
             }
         }
+    };
+}
 
-        // (2). Gather all the unique type tags to convert into layouts. There are relatively few
-        // primitive types so this is worth doing to avoid redundant work.
-        let unique_tags: BTreeSet<_> = tags
-            .iter()
-            .flat_map(|t| t.clone())
-            .flat_map(|t| t.ok())
-            .collect();
+define_resolver! {
+    resolver: Resolver,
+    store_trait: PackageStore,
+    add_type_tag: add_type_tag,
+    add_signature: add_signature,
+    async: { async },
+    await: { .await },
+}
 
-        // (3). Convert the type tags into layouts.
-        let mut layouts = BTreeMap::new();
-        for tag in unique_tags {
-            let layout = self.type_layout(tag.clone()).await?;
-            layouts.insert(tag, layout);
-        }
-
-        // (4) Prepare the result vector.
-        Ok(tags
-            .iter()
-            .map(|t| -> Option<_> {
-                let t = t.as_ref()?;
-                let t = t.as_ref().ok()?;
-                layouts.get(t).cloned()
-            })
-            .collect())
-    }
-
-    /// Resolves a runtime address in a `ModuleId` to a storage `ModuleId` according to the linkage
-    /// table in the `context` which must refer to a package.
-    /// * Will fail if the wrong context is provided, i.e., is not a package, or
-    ///   does not exist.
-    /// * Will fail if an invalid `context` is provided for the `location`, i.e., the package at
-    ///   `context` does not contain the module that `location` refers to.
-    pub async fn resolve_module_id(
-        &self,
-        module_id: ModuleId,
-        context: AccountAddress,
-    ) -> Result<ModuleId> {
-        let package = self.package_store.fetch(context).await?;
-        let storage_id = package.relocate(*module_id.address())?;
-        Ok(ModuleId::new(storage_id, module_id.name().to_owned()))
-    }
-
-    /// Resolves an abort code following the clever error format to a `CleverError` enum.
-    /// The `module_id` must be the storage ID of the module (which can e.g., be gotten from the
-    /// `resolve_module_id` function) and not the runtime ID.
-    ///
-    /// If the `abort_code` is not a clever error (i.e., does not follow the tagging and layout as
-    /// defined in `ErrorBitset`), this function will return `None`.
-    ///
-    /// In the case where it is a clever error but only a line number is present (i.e., the error
-    /// is the result of an `assert!(<cond>)` source expression) a `CleverError::LineNumberOnly` is
-    /// returned. Otherwise a `CleverError::CompleteError` is returned.
-    ///
-    /// If for any reason we are unable to resolve the abort code to a `CleverError`, this function
-    /// will return `None`.
-    pub async fn resolve_clever_error(
-        &self,
-        module_id: ModuleId,
-        abort_code: u64,
-    ) -> Option<CleverError> {
-        let _bitset = ErrorBitset::from_u64(abort_code)?;
-        let package = self.package_store.fetch(*module_id.address()).await.ok()?;
-        package.resolve_clever_error(module_id.name().as_str(), abort_code)
-    }
+define_resolver! {
+    resolver: SyncResolver,
+    store_trait: SyncPackageStore,
+    add_type_tag: add_type_tag_sync,
+    add_signature: add_signature_sync,
+    async: { },
+    await: { },
 }
 
 impl<T> PackageStoreWithLruCache<T> {
@@ -1213,215 +1511,9 @@ impl<'l> ResolutionContext<'l> {
         }
     }
 
-    /// Gather definitions for types that contribute to the definition of `tag` into this resolution
-    /// context, fetching data from the `store` as necessary. Also updates package addresses in
-    /// `tag` to point to runtime IDs instead of storage IDs to ensure queries made using these
-    /// addresses during the subsequent resolution phase find the relevant type information in the
-    /// context.
-    ///
-    /// The `visit_fields` flag controls whether the traversal looks inside types at their fields
-    /// (which is necessary for layout resolution) or not (only explores the outer type and any type
-    /// parameters).
-    ///
-    /// The `visit_phantoms` flag controls whether the traversal recurses through phantom type
-    /// parameters (which is also necessary for type resolution) or not.
-    async fn add_type_tag<S: PackageStore + ?Sized>(
-        &mut self,
-        tag: &mut TypeTag,
-        store: &S,
-        visit_fields: bool,
-        visit_phantoms: bool,
-    ) -> Result<()> {
-        use TypeTag as T;
-
-        struct ToVisit<'t> {
-            tag: &'t mut TypeTag,
-            depth: usize,
-        }
-
-        let mut frontier = vec![ToVisit { tag, depth: 0 }];
-        while let Some(ToVisit { tag, depth }) = frontier.pop() {
-            macro_rules! push_ty_param {
-                ($tag:expr) => {{
-                    check_max_limit!(
-                        TypeParamNesting, self.limits;
-                        max_type_argument_depth > depth
-                    );
-
-                    frontier.push(ToVisit { tag: $tag, depth: depth + 1 })
-                }}
-            }
-
-            match tag {
-                T::Address
-                | T::Bool
-                | T::U8
-                | T::U16
-                | T::U32
-                | T::U64
-                | T::U128
-                | T::U256
-                | T::Signer => {
-                    // Nothing further to add to context
-                }
-
-                T::Vector(tag) => push_ty_param!(tag),
-
-                T::Struct(s) => {
-                    let context = store.fetch(s.address).await?;
-                    let def = context
-                        .clone()
-                        .data_def(s.module.as_str(), s.name.as_str())?;
-
-                    // Normalize `address` (the ID of a package that contains the definition of this
-                    // struct) to be a runtime ID, because that's what the resolution context uses
-                    // for keys.  Take care to do this before generating the key that is used to
-                    // query and/or write into `self.structs.
-                    s.address = context.runtime_id;
-                    let key = DatatypeRef::from(s.as_ref()).as_key();
-
-                    if def.type_params.len() != s.type_params.len() {
-                        return Err(Error::TypeArityMismatch(
-                            def.type_params.len(),
-                            s.type_params.len(),
-                        ));
-                    }
-
-                    check_max_limit!(
-                        TooManyTypeParams, self.limits;
-                        max_type_argument_width >= s.type_params.len()
-                    );
-
-                    for (param, def) in s.type_params.iter_mut().zip_eq(def.type_params.iter()) {
-                        if !def.is_phantom || visit_phantoms {
-                            push_ty_param!(param);
-                        }
-                    }
-
-                    if self.datatypes.contains_key(&key) {
-                        continue;
-                    }
-
-                    if visit_fields {
-                        match &def.data {
-                            MoveData::Struct(fields) => {
-                                for (_, sig) in fields {
-                                    self.add_signature(sig.clone(), store, &context, visit_fields)
-                                        .await?;
-                                }
-                            }
-                            MoveData::Enum(variants) => {
-                                for variant in variants {
-                                    for (_, sig) in &variant.signatures {
-                                        self.add_signature(
-                                            sig.clone(),
-                                            store,
-                                            &context,
-                                            visit_fields,
-                                        )
-                                        .await?;
-                                    }
-                                }
-                            }
-                        };
-                    }
-
-                    check_max_limit!(
-                        TooManyTypeNodes, self.limits;
-                        max_type_nodes > self.datatypes.len()
-                    );
-
-                    self.datatypes.insert(key, def);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    // Like `add_type_tag` but for type signatures.  Needs a linkage table to translate runtime IDs
-    // into storage IDs.
-    async fn add_signature<T: PackageStore + ?Sized>(
-        &mut self,
-        sig: OpenSignatureBody,
-        store: &T,
-        context: &Package,
-        visit_fields: bool,
-    ) -> Result<()> {
-        use OpenSignatureBody as O;
-
-        let mut frontier = vec![sig];
-        while let Some(sig) = frontier.pop() {
-            match sig {
-                O::Address
-                | O::Bool
-                | O::U8
-                | O::U16
-                | O::U32
-                | O::U64
-                | O::U128
-                | O::U256
-                | O::TypeParameter(_) => {
-                    // Nothing further to add to context
-                }
-
-                O::Vector(sig) => frontier.push(*sig),
-
-                O::Datatype(key, params) => {
-                    check_max_limit!(
-                        TooManyTypeParams, self.limits;
-                        max_type_argument_width >= params.len()
-                    );
-
-                    let params_count = params.len();
-                    let data_count = self.datatypes.len();
-                    frontier.extend(params.into_iter());
-
-                    let type_params = if let Some(def) = self.datatypes.get(&key) {
-                        &def.type_params
-                    } else {
-                        check_max_limit!(
-                            TooManyTypeNodes, self.limits;
-                            max_type_nodes > data_count
-                        );
-
-                        // Need to resolve the datatype, so fetch the package that contains it.
-                        let storage_id = context.relocate(key.package)?;
-                        let package = store.fetch(storage_id).await?;
-
-                        let def = package.data_def(&key.module, &key.name)?;
-                        if visit_fields {
-                            match &def.data {
-                                MoveData::Struct(fields) => {
-                                    frontier.extend(fields.iter().map(|f| &f.1).cloned());
-                                }
-                                MoveData::Enum(variants) => {
-                                    frontier.extend(
-                                        variants
-                                            .iter()
-                                            .flat_map(|v| v.signatures.iter().map(|(_, s)| s))
-                                            .cloned(),
-                                    );
-                                }
-                            };
-                        }
-
-                        &self.datatypes.entry(key).or_insert(def).type_params
-                    };
-
-                    if type_params.len() != params_count {
-                        return Err(Error::TypeArityMismatch(type_params.len(), params_count));
-                    }
-                }
-            }
-        }
-
-        Ok(())
-    }
-
     /// Translate runtime IDs in a type `tag` into defining IDs using only the information
     /// contained in this context. Requires that the necessary information was added to the context
-    /// through calls to `add_type_tag`.
+    /// through calls to `add_type_tag` (or `add_type_tag_sync`).
     fn canonicalize_type(&self, tag: &mut TypeTag) -> Result<()> {
         use TypeTag as T;
 
