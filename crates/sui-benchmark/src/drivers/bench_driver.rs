@@ -220,22 +220,6 @@ struct Stats {
     pub bench_stats: BenchmarkStats,
 }
 
-#[derive(Debug)]
-pub enum ClientType {
-    // Used for Mysticeti Fast Path
-    TransactionDriver,
-    // Used for original tx certification then fast path + Mysticeti
-    QuorumDriver,
-}
-
-impl std::fmt::Display for ClientType {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            ClientType::TransactionDriver => write!(f, "transaction_driver"),
-            ClientType::QuorumDriver => write!(f, "quorum_driver"),
-        }
-    }
-}
 
 type RetryType = Box<(Transaction, Box<dyn Payload>)>;
 
@@ -816,9 +800,9 @@ async fn run_bench_worker(
                                                start: Arc<Instant>,
                                                transaction: Transaction,
                                                mut payload: Box<dyn Payload>,
-                                               committee: Arc<Committee>,
-                                               client_type: ClientType|
+                                               committee: Arc<Committee>|
      -> NextOp {
+        let payload_str = payload.to_string();
         match result {
             Ok(effects) => {
                 assert!(
@@ -842,11 +826,11 @@ async fn run_bench_worker(
                 let square_latency_ms = latency.as_secs_f64().powf(2.0);
                 metrics
                     .latency_s
-                    .with_label_values(&[&payload.to_string(), &client_type.to_string()])
+                    .with_label_values(&[payload_str.as_str(), "transaction_driver"])
                     .observe(latency.as_secs_f64());
                 metrics
                     .latency_squared_s
-                    .with_label_values(&[&payload.to_string(), &client_type.to_string()])
+                    .with_label_values(&[payload_str.as_str(), "transaction_driver"])
                     .inc_by(square_latency_ms);
 
                 let num_commands =
@@ -855,19 +839,19 @@ async fn run_bench_worker(
                 if effects.is_ok() {
                     metrics
                         .num_success
-                        .with_label_values(&[&payload.to_string(), &client_type.to_string()])
+                        .with_label_values(&[payload_str.as_str(), "transaction_driver"])
                         .inc();
                     metrics
                         .num_success_cmds
-                        .with_label_values(&[&payload.to_string(), &client_type.to_string()])
+                        .with_label_values(&[payload_str.as_str(), "transaction_driver"])
                         .inc_by(num_commands as u64);
                 } else {
                     metrics
                         .num_error
                         .with_label_values(&[
-                            payload.to_string().as_str(),
+                            payload_str.as_str(),
                             "execution",
-                            client_type.to_string().as_str(),
+                            "transaction_driver",
                         ])
                         .inc();
                 }
@@ -891,7 +875,7 @@ async fn run_bench_worker(
             }
             Err(err) => {
                 tracing::error!(
-                    "Transaction execution got error: {}. Transaction digest: {:?}. Client type: {client_type}",
+                    "Transaction execution got error: {}. Transaction digest: {:?}.",
                     err,
                     transaction.digest()
                 );
@@ -906,7 +890,7 @@ async fn run_bench_worker(
                     Some(_) => {
                         metrics
                             .num_expected_error
-                            .with_label_values(&[&payload.to_string(), &client_type.to_string()])
+                            .with_label_values(&[payload_str.as_str(), "transaction_driver"])
                             .inc();
                         NextOp::Retry(Box::new((transaction, payload)))
                     }
@@ -930,9 +914,9 @@ async fn run_bench_worker(
                             metrics
                                 .num_error
                                 .with_label_values(&[
-                                    payload.to_string().as_str(),
+                                    payload_str.as_str(),
                                     "rpc",
-                                    client_type.to_string().as_str(),
+                                    "transaction_driver",
                                 ])
                                 .inc();
                             NextOp::Retry(Box::new((transaction, payload)))
@@ -1039,9 +1023,10 @@ async fn run_bench_worker(
                     let num_in_flight_metric = metrics.num_in_flight.with_label_values(&[&payload.to_string()]);
                     let res = worker.execution_proxy
                         .execute_transaction_block(tx.clone())
-                        .then(|(client_type, res)| async move  {
-                            metrics.num_submitted.with_label_values(&[&payload.to_string(), &client_type.to_string()]).inc();
-                            handle_execute_transaction_response(res, start, tx, payload, committee, client_type)
+                        .then(|res| async move  {
+                            let payload_str = payload.to_string();
+                            metrics.num_submitted.with_label_values(&[payload_str.as_str(), "transaction_driver"]).inc();
+                            handle_execute_transaction_response(res, start, tx, payload, committee)
                         }).count_in_flight(num_in_flight_metric);
                     futures.push(Box::pin(res));
                     continue
@@ -1096,7 +1081,7 @@ async fn run_bench_worker(
                                         {
                                             let tx = bundle_txs.into_iter().next().unwrap();
                                             let digest = *tx.digest();
-                                            let (_, exec_result) =
+                                            let exec_result =
                                                 proxy.execute_transaction_block(tx).await;
                                             exec_result.map(|effects| {
                                                 vec![(digest, BundleItemResponse::DirectEffects(effects.into()))]
@@ -1139,7 +1124,7 @@ async fn run_bench_worker(
                         let committee_size = committee.num_members();
                         let proxy = worker.execution_proxy.clone_new();
                         let res = async move {
-                            let (client_type, res) = if use_amplification {
+                            let res = if use_amplification {
                                 // Cap at 5 validators to limit amplification traffic and reduce latency impact
                                 let max_validators = committee_size.min(5);
                                 let min_validators = 3.min(max_validators);
@@ -1148,8 +1133,9 @@ async fn run_bench_worker(
                             } else {
                                 proxy.execute_transaction_block(tx.clone()).await
                             };
-                            metrics.num_submitted.with_label_values(&[&payload.to_string(), &client_type.to_string()]).inc();
-                            handle_execute_transaction_response(res, start, tx, payload, committee, client_type)
+                            let payload_str = payload.to_string();
+                            metrics.num_submitted.with_label_values(&[payload_str.as_str(), "transaction_driver"]).inc();
+                            handle_execute_transaction_response(res, start, tx, payload, committee)
                         }.count_in_flight(num_in_flight_metric);
                         futures.push(Box::pin(res));
                     }

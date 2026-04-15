@@ -610,7 +610,7 @@ impl Workload<dyn Payload> for RandomizedTransactionWorkload {
                     .build_and_sign(keypair.as_ref());
                 let proxy_ref = execution_proxy.clone();
                 futures.push(async move {
-                    let (_, execution_result) =
+                    let execution_result =
                         proxy_ref.execute_transaction_block(transaction).await;
                     execution_result.unwrap().created()[0].0
                 });
@@ -635,7 +635,7 @@ impl Workload<dyn Payload> for RandomizedTransactionWorkload {
                     ],
                 )
                 .build_and_sign(keypair.as_ref());
-            let (_, execution_result) =
+            let execution_result =
                 execution_proxy.execute_transaction_block(transaction).await;
             let effects = execution_result.expect("Failed to create immutable object");
             let created_obj = effects.created()[0].0;
@@ -651,7 +651,7 @@ impl Workload<dyn Payload> for RandomizedTransactionWorkload {
                     vec![CallArg::Object(ObjectArg::ImmOrOwnedObject(created_obj))],
                 )
                 .build_and_sign(keypair.as_ref());
-            let (_, execution_result) =
+            let execution_result =
                 execution_proxy.execute_transaction_block(transaction).await;
             let effects = execution_result.expect("Failed to freeze object");
 
@@ -686,7 +686,7 @@ impl Workload<dyn Payload> for RandomizedTransactionWorkload {
                     .build_and_sign(keypair.as_ref());
                 let proxy_ref = execution_proxy.clone();
                 futures.push(async move {
-                    let (_, execution_result) =
+                    let execution_result =
                         proxy_ref.execute_transaction_block(transaction).await;
                     let effects = execution_result.unwrap();
 
