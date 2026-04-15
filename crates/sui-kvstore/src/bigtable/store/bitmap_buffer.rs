@@ -55,10 +55,13 @@ use tracing::debug;
 use tracing::error;
 
 use crate::bigtable::client::BigTableClient;
+use crate::bigtable::proto::bigtable::v2::mutate_rows_request::Entry;
 use crate::tables;
 
 const PRE_RESTART_LOAD_CHUNK_SIZE: usize = 100;
 const PRE_RESTART_LOAD_CONCURRENCY: usize = 10;
+const FLUSH_WRITE_CHUNK_SIZE: usize = 5_000;
+const FLUSH_WRITE_CONCURRENCY: usize = 10;
 
 /// One bit to set in a bitmap-index row, plus the checkpoint metadata the
 /// buffer needs to determine cell timestamps and seal-for-eviction conditions.
@@ -256,7 +259,7 @@ impl BitmapBuffer {
 
         // 3. Serialize every dirty row in place (we own canonical
         // exclusively) and collect entries to write.
-        let entries = {
+        let entries: Vec<Entry> = {
             let mut state = self.flush_state.lock().unwrap();
             let FlushState { canonical, cps, .. } = &mut *state;
             canonical
@@ -284,7 +287,29 @@ impl BitmapBuffer {
 
         // 4. Write outside the lock. Commits keep sending to the channel;
         // canonical doesn't change until the next flush drains.
-        client.write_entries(self.table, entries).await?;
+        let entry_count = entries.len();
+        let chunk_count = entry_count.div_ceil(FLUSH_WRITE_CHUNK_SIZE);
+        let write_chunks = entries
+            .chunks(FLUSH_WRITE_CHUNK_SIZE)
+            .map(|chunk| chunk.to_vec())
+            .collect::<Vec<_>>();
+        let mut writes = stream::iter(write_chunks)
+            .map(|chunk| {
+                let mut client = client.clone();
+                async move { client.write_entries(self.table, chunk).await }
+            })
+            .buffer_unordered(FLUSH_WRITE_CONCURRENCY);
+        while let Some(result) = writes.next().await {
+            result?;
+        }
+        debug!(
+            table = self.table,
+            rows = entry_count,
+            chunks = chunk_count,
+            chunk_size = FLUSH_WRITE_CHUNK_SIZE,
+            chunk_concurrency = FLUSH_WRITE_CONCURRENCY,
+            "Flushed bitmap rows to BigTable",
+        );
 
         // 5. Mark every dirty row clean (nothing else touched canonical
         // during IO) and evict sealed rows.

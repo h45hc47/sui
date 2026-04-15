@@ -373,7 +373,11 @@ impl BigTableIndexer {
 
         indexer
             .concurrent_pipeline(
-                BitmapIndexHandler::new(TransactionBitmapProcessor, &pipeline.bitmap_index),
+                BitmapIndexHandler::new(
+                    TransactionBitmapProcessor,
+                    &pipeline.bitmap_index,
+                    build_rate_limiter(&pipeline.bitmap_index, base_rps, &global),
+                ),
                 pipeline.bitmap_index.finish(base.clone()),
             )
             .await?;
@@ -499,7 +503,11 @@ impl BigTableIndexer {
             .await?;
         indexer
             .concurrent_pipeline(
-                BitmapIndexHandler::new(EventBitmapProcessor, &pipeline.event_bitmap_index),
+                BitmapIndexHandler::new(
+                    EventBitmapProcessor,
+                    &pipeline.event_bitmap_index,
+                    build_rate_limiter(&pipeline.event_bitmap_index, base_rps, &global),
+                ),
                 pipeline.event_bitmap_index.finish(base.clone()),
             )
             .await?;

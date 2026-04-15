@@ -27,19 +27,28 @@ use crate::bigtable::store::BitmapIndexBatch;
 use crate::bigtable::store::BitmapIndexProcessor;
 use crate::bigtable::store::BitmapIndexValue;
 use crate::config::ConcurrentLayer;
+use crate::rate_limiter::CompositeRateLimiter;
 
 /// Generic wrapper that implements `concurrent::Handler` for any
 /// [`BitmapIndexProcessor`].
 pub struct BitmapIndexHandler<P> {
     processor: P,
+    rate_limiter: Arc<CompositeRateLimiter>,
 }
 
 impl<P> BitmapIndexHandler<P>
 where
     P: BitmapIndexProcessor + Send + Sync + 'static,
 {
-    pub(crate) fn new(processor: P, _config: &ConcurrentLayer) -> Self {
-        Self { processor }
+    pub(crate) fn new(
+        processor: P,
+        _config: &ConcurrentLayer,
+        rate_limiter: Arc<CompositeRateLimiter>,
+    ) -> Self {
+        Self {
+            processor,
+            rate_limiter,
+        }
     }
 }
 
@@ -82,6 +91,7 @@ where
     ) -> anyhow::Result<usize> {
         let msg = batch.take();
         let n: usize = msg.rows.values().map(|r| r.bitmap.len() as usize).sum();
+        self.rate_limiter.acquire(n).await;
         conn.send_bitmap_batch::<P>(msg);
         Ok(n)
     }
