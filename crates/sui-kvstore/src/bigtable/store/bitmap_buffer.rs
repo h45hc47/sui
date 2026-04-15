@@ -49,6 +49,8 @@ use roaring::RoaringBitmap;
 use sui_indexer_alt_framework::pipeline::Processor;
 use sui_indexer_alt_framework_store_traits::CommitterWatermark;
 use tokio::sync::mpsc;
+use tracing::debug;
+use tracing::error;
 
 use crate::bigtable::client::BigTableClient;
 use crate::tables;
@@ -335,11 +337,33 @@ impl BitmapBuffer {
             return Ok(());
         }
 
+        let need_load_len = need_load.len();
+        debug!(
+            table = self.table,
+            rows = need_load_len,
+            "Loading pre-restart bitmap rows from BigTable",
+        );
+
         let mut db_bitmaps: HashMap<Bytes, RoaringBitmap> = HashMap::new();
-        let fetched = client
-            .multi_get(self.table, need_load, None)
-            .await
-            .context("loading pre-existing bitmap rows from BigTable")?;
+        let fetched = match client.multi_get(self.table, need_load, None).await {
+            Ok(fetched) => fetched,
+            Err(e) => {
+                error!(
+                    table = self.table,
+                    rows = need_load_len,
+                    error = %e,
+                    error_debug = ?e,
+                    "Failed loading pre-restart bitmap rows from BigTable",
+                );
+                return Err(e).context("loading pre-existing bitmap rows from BigTable");
+            }
+        };
+        debug!(
+            table = self.table,
+            rows = need_load_len,
+            fetched = fetched.len(),
+            "Loaded pre-restart bitmap rows from BigTable",
+        );
         for (row_key, cells) in fetched {
             for (col, val) in cells {
                 if col.as_ref() == self.column.as_bytes() {
