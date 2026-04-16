@@ -4813,7 +4813,6 @@ impl ProtocolConfig {
                     }
                     cfg.feature_flags
                         .early_return_receive_object_mismatched_type = true;
-
                 }
                 122 => {
                     // Enable bulletproofs range proofs on devnet
