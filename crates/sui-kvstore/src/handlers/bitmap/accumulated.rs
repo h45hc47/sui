@@ -46,8 +46,6 @@ use crate::tables;
 
 const PRE_RESTART_LOAD_CHUNK_SIZE: usize = 100;
 const PRE_RESTART_LOAD_CONCURRENCY: usize = 10;
-const FLUSH_WRITE_CHUNK_SIZE: usize = 100;
-const FLUSH_WRITE_CONCURRENCY: usize = 100;
 
 /// Accumulated bitmap state for a single pipeline: bits OR'd in over the
 /// lifetime of this process (plus, for the one straddler bucket, a lazy
@@ -67,6 +65,10 @@ pub struct AccumulatedState {
     /// only bucket whose rows could have pre-restart bits already in
     /// BigTable. All other buckets' rows skip the DB load.
     startup_tx_hi: u64,
+    /// Max entries per BigTable write RPC during `flush`.
+    flush_write_chunk_size: usize,
+    /// Max parallel BigTable write RPCs during `flush`.
+    flush_write_concurrency: usize,
     /// Accumulated bits per row.
     rows: HashMap<Bytes, BitmapIndexValue>,
     /// Row keys modified since the last successful flush — the set written
@@ -84,12 +86,16 @@ impl AccumulatedState {
         column: &'static str,
         seal_fn: fn(u64) -> u64,
         startup_tx_hi: u64,
+        flush_write_chunk_size: usize,
+        flush_write_concurrency: usize,
     ) -> Self {
         Self {
             table,
             column,
             seal_fn,
             startup_tx_hi,
+            flush_write_chunk_size,
+            flush_write_concurrency,
             rows: HashMap::new(),
             dirty: HashSet::new(),
             needs_load_from_db: HashSet::new(),
@@ -97,8 +103,19 @@ impl AccumulatedState {
     }
 
     /// Construct from a [`BitmapIndexProcessor`]'s associated constants.
-    pub fn for_processor<P: BitmapIndexProcessor>(startup_tx_hi: u64) -> Self {
-        Self::new(P::TABLE, P::COLUMN, P::seal_tx_hi_exclusive, startup_tx_hi)
+    pub fn for_processor<P: BitmapIndexProcessor>(
+        startup_tx_hi: u64,
+        flush_write_chunk_size: usize,
+        flush_write_concurrency: usize,
+    ) -> Self {
+        Self::new(
+            P::TABLE,
+            P::COLUMN,
+            P::seal_tx_hi_exclusive,
+            startup_tx_hi,
+            flush_write_chunk_size,
+            flush_write_concurrency,
+        )
     }
 
     /// OR the batch into accumulated state. Idempotent: re-applying the
@@ -176,9 +193,11 @@ impl AccumulatedState {
             return Ok(0);
         }
 
-        let chunk_count = entry_count.div_ceil(FLUSH_WRITE_CHUNK_SIZE);
+        let chunk_size = self.flush_write_chunk_size;
+        let chunk_concurrency = self.flush_write_concurrency;
+        let chunk_count = entry_count.div_ceil(chunk_size);
         let write_chunks = entries
-            .chunks(FLUSH_WRITE_CHUNK_SIZE)
+            .chunks(chunk_size)
             .map(|chunk| chunk.to_vec())
             .collect::<Vec<_>>();
         // Wait for every chunk to finish, not just the first failure.
@@ -195,7 +214,7 @@ impl AccumulatedState {
                     (chunk_keys, res)
                 }
             })
-            .buffer_unordered(FLUSH_WRITE_CONCURRENCY)
+            .buffer_unordered(chunk_concurrency)
             .collect()
             .await;
 
@@ -231,8 +250,8 @@ impl AccumulatedState {
             table,
             rows = entry_count,
             chunks = chunk_count,
-            chunk_size = FLUSH_WRITE_CHUNK_SIZE,
-            chunk_concurrency = FLUSH_WRITE_CONCURRENCY,
+            chunk_size,
+            chunk_concurrency,
             remaining_dirty = self.dirty.len(),
             "Flushed bitmap rows to BigTable",
         );
@@ -401,6 +420,8 @@ mod tests {
     const TABLE: &str = transaction_bitmap_index::NAME;
     const FAMILY: &str = tables::FAMILY;
     const COL: &str = transaction_bitmap_index::col::BITMAP;
+    const TEST_FLUSH_WRITE_CHUNK_SIZE: usize = 100;
+    const TEST_FLUSH_WRITE_CONCURRENCY: usize = 4;
 
     struct TestProcessor;
 
@@ -434,7 +455,11 @@ mod tests {
     }
 
     fn accumulated(startup_tx_hi: u64) -> AccumulatedState {
-        AccumulatedState::for_processor::<TestProcessor>(startup_tx_hi)
+        AccumulatedState::for_processor::<TestProcessor>(
+            startup_tx_hi,
+            TEST_FLUSH_WRITE_CHUNK_SIZE,
+            TEST_FLUSH_WRITE_CONCURRENCY,
+        )
     }
 
     /// Build a `BitmapIndexBatch` from flat values, mimicking what the

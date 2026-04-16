@@ -7,6 +7,7 @@ use sui_default_config::DefaultConfig;
 use sui_indexer_alt_framework::config::ConcurrencyConfig;
 use sui_indexer_alt_framework::pipeline::CommitterConfig;
 use sui_indexer_alt_framework::pipeline::concurrent::ConcurrentConfig;
+use sui_indexer_alt_framework::pipeline::sequential::SequentialConfig;
 use sui_indexer_alt_framework::{self as framework};
 use tracing::warn;
 
@@ -162,8 +163,51 @@ impl ConcurrentLayer {
 
 #[DefaultConfig]
 #[derive(Clone, Default, Debug)]
+pub struct SequentialLayer {
+    // Framework sequential surface — mirrors the fields actually read by
+    // `sui_indexer_alt_framework::pipeline::sequential`.
+    pub committer: Option<CommitterLayer>,
+    pub checkpoint_lag: Option<u64>,
+    pub fanout: Option<ConcurrencyConfig>,
+    pub min_eager_rows: Option<usize>,
+    pub max_batch_checkpoints: Option<usize>,
+    pub processor_channel_size: Option<usize>,
+
+    // sui-kvstore extensions: the sequential framework doesn't expose a
+    // `write_concurrency` of its own, and in-handler BigTable writes aren't
+    // part of the framework's surface — these fill those gaps for handlers
+    // (e.g. `BitmapIndexHandler`) that drive parallel RPCs themselves.
+    /// Parallelism of in-handler BigTable writes.
+    pub write_concurrency: Option<usize>,
+    /// Maximum rows per in-handler BigTable write RPC. Same semantic as
+    /// `ConcurrentLayer::max_rows`.
+    pub max_rows: Option<usize>,
+    /// Per-pipeline rate limit (rows per second). Overrides the default
+    /// `IndexerConfig::max_rows_per_second` when set.
+    pub max_rows_per_second: Option<u64>,
+}
+
+impl SequentialLayer {
+    pub fn finish(self, base: ConcurrentConfig) -> SequentialConfig {
+        let committer = if let Some(c) = self.committer {
+            c.finish(base.committer)
+        } else {
+            base.committer
+        };
+        SequentialConfig {
+            committer,
+            checkpoint_lag: self.checkpoint_lag.unwrap_or(0),
+            fanout: self.fanout.or(base.fanout),
+            min_eager_rows: self.min_eager_rows.or(base.min_eager_rows),
+            max_batch_checkpoints: self.max_batch_checkpoints,
+            processor_channel_size: self.processor_channel_size.or(base.processor_channel_size),
+        }
+    }
+}
+
+#[DefaultConfig]
+#[derive(Clone, Default, Debug)]
 pub struct PipelineLayer {
-    pub bitmap_index: ConcurrentLayer,
     pub checkpoints: ConcurrentLayer,
     pub checkpoints_by_digest: ConcurrentLayer,
     pub transactions: ConcurrentLayer,
@@ -176,7 +220,8 @@ pub struct PipelineLayer {
     pub packages_by_checkpoint: ConcurrentLayer,
     pub system_packages: ConcurrentLayer,
     pub tx_seq_digest: ConcurrentLayer,
-    pub event_bitmap_index: ConcurrentLayer,
+    pub transaction_bitmap_index: SequentialLayer,
+    pub event_bitmap_index: SequentialLayer,
 }
 
 /// This type is identical to [`framework::ingestion::IngestionConfig`], but is set-up to be

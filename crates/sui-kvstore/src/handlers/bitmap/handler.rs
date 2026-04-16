@@ -21,7 +21,8 @@ use sui_types::full_checkpoint_content::Checkpoint;
 use tokio::sync::Mutex;
 
 use crate::bigtable::store::BigTableStore;
-use crate::config::ConcurrentLayer;
+use crate::config::SequentialLayer;
+use crate::handlers::DEFAULT_MAX_ROWS;
 use crate::handlers::bitmap::BitmapIndexProcessor;
 use crate::handlers::bitmap::BitmapIndexValue;
 use crate::handlers::bitmap::accumulated::AccumulatedState;
@@ -38,21 +39,32 @@ pub struct BitmapIndexHandler<P> {
     processor: P,
     rate_limiter: Arc<CompositeRateLimiter>,
     accumulated: Arc<Mutex<Option<AccumulatedState>>>,
+    flush_write_concurrency: usize,
+    flush_write_chunk_size: usize,
 }
 
 impl<P> BitmapIndexHandler<P>
 where
     P: BitmapIndexProcessor + Send + Sync + 'static,
 {
+    /// `global_write_concurrency` is the fully-resolved
+    /// `IndexerConfig::committer.write_concurrency` (framework default merged
+    /// with any global TOML override). Per-pipeline `config.write_concurrency`
+    /// takes precedence when set; otherwise we fall through to the global.
     pub(crate) fn new(
         processor: P,
-        _config: &ConcurrentLayer,
+        config: &SequentialLayer,
+        global_write_concurrency: usize,
         rate_limiter: Arc<CompositeRateLimiter>,
     ) -> Self {
+        let flush_write_concurrency = config.write_concurrency.unwrap_or(global_write_concurrency);
+        let flush_write_chunk_size = config.max_rows.unwrap_or(DEFAULT_MAX_ROWS);
         Self {
             processor,
             rate_limiter,
             accumulated: Arc::new(Mutex::new(None)),
+            flush_write_concurrency,
+            flush_write_chunk_size,
         }
     }
 }
@@ -106,7 +118,11 @@ where
 
         let mut state = self.accumulated.lock().await;
         let state = state.get_or_insert_with(|| {
-            AccumulatedState::for_processor::<P>(conn.startup_tx_hi(P::NAME))
+            AccumulatedState::for_processor::<P>(
+                conn.startup_tx_hi(P::NAME),
+                self.flush_write_chunk_size,
+                self.flush_write_concurrency,
+            )
         });
         state.merge_batch(batch);
         state
