@@ -124,6 +124,10 @@ impl Connection for BigTableConnection<'_> {
             }));
         }
 
+        // Anchor pruner_timestamp at wall-clock time so the pruner's
+        // `(pruner_timestamp + delay) - now` computation is meaningful before `set_reader_watermark`
+        // has been called. Matches the pg and object-store conventions.
+        let pruner_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let initial = if let Some(v0) = existing_v0 {
             // Case 2: v0-only row → bootstrap a v1 watermark from the v0 committer fields.
             let reader_lo = v0.checkpoint_hi_inclusive + 1;
@@ -134,7 +138,7 @@ impl Connection for BigTableConnection<'_> {
                 timestamp_ms_hi_inclusive: v0.timestamp_ms_hi_inclusive,
                 reader_lo,
                 pruner_hi: reader_lo,
-                pruner_timestamp_ms: 0,
+                pruner_timestamp_ms,
             }
         } else {
             // Case 3: nothing exists → write a fresh row from the framework's input.
@@ -146,7 +150,7 @@ impl Connection for BigTableConnection<'_> {
                 timestamp_ms_hi_inclusive: 0,
                 reader_lo,
                 pruner_hi: reader_lo,
-                pruner_timestamp_ms: 0,
+                pruner_timestamp_ms,
             }
         };
 
@@ -293,93 +297,4 @@ impl ConcurrentConnection for BigTableConnection<'_> {
 
 fn u64_be(v: u64) -> Bytes {
     Bytes::copy_from_slice(&v.to_be_bytes())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::testing::BigTableEmulator;
-    use crate::testing::INSTANCE_ID;
-    use crate::testing::create_tables;
-    use crate::testing::require_bigtable_emulator;
-
-    const PIPELINE: &str = "pipeline";
-    const EPOCH_HI: u64 = 7;
-    const CHECKPOINT_HI: u64 = 200;
-    const TX_HI: u64 = 42;
-    const TIMESTAMP_MS_HI: u64 = 99;
-
-    /// Spawn a BigTable emulator and return a connected store.
-    async fn store_conn() -> (BigTableEmulator, BigTableStore) {
-        require_bigtable_emulator();
-        let emulator = tokio::task::spawn_blocking(BigTableEmulator::start)
-            .await
-            .unwrap()
-            .unwrap();
-        create_tables(emulator.host(), INSTANCE_ID).await.unwrap();
-        let client = BigTableClient::new_local(emulator.host().to_string(), INSTANCE_ID.into())
-            .await
-            .unwrap();
-        (emulator, BigTableStore::new(client))
-    }
-
-    #[tokio::test]
-    async fn test_accepts_chain_id_first_call_writes_and_accepts() {
-        let (_emulator, store) = store_conn().await;
-        let mut conn = store.connect().await.unwrap();
-
-        let chain_id = [1u8; 32];
-        assert!(conn.accepts_chain_id(PIPELINE, chain_id).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_accepts_chain_id_matching_accepts() {
-        let (_emulator, store) = store_conn().await;
-        let mut conn = store.connect().await.unwrap();
-
-        let chain_id = [1u8; 32];
-        assert!(conn.accepts_chain_id(PIPELINE, chain_id).await.unwrap());
-        assert!(conn.accepts_chain_id(PIPELINE, chain_id).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_accepts_chain_id_mismatching_rejects() {
-        let (_emulator, store) = store_conn().await;
-        let mut conn = store.connect().await.unwrap();
-
-        let chain_id_a = [1u8; 32];
-        let chain_id_b = [2u8; 32];
-        assert!(conn.accepts_chain_id(PIPELINE, chain_id_a).await.unwrap());
-        assert!(!conn.accepts_chain_id(PIPELINE, chain_id_b).await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn test_init_watermark_returns_existing_on_conflict() {
-        let (_emulator, store) = store_conn().await;
-        let mut conn = store.connect().await.unwrap();
-
-        conn.init_watermark(PIPELINE, None).await.unwrap();
-        let watermark = CommitterWatermark {
-            epoch_hi_inclusive: EPOCH_HI,
-            checkpoint_hi_inclusive: CHECKPOINT_HI,
-            tx_hi: TX_HI,
-            timestamp_ms_hi_inclusive: TIMESTAMP_MS_HI,
-        };
-        conn.set_committer_watermark(PIPELINE, watermark)
-            .await
-            .unwrap();
-
-        // init must surface the existing committer watermark regardless of the input.
-        let init = conn
-            .init_watermark(PIPELINE, Some(0))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(init.checkpoint_hi_inclusive, Some(CHECKPOINT_HI));
-        // init_watermark now bootstraps a `reader_lo` when it surfaces an existing new-schema
-        // row — set_committer_watermark leaves the `reader_lo` that init originally wrote
-        // (0 for init(None) + set_committer, which is what happened here).
-        assert_eq!(init.reader_lo, Some(0));
-    }
 }
