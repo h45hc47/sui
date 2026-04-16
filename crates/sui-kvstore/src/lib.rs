@@ -21,6 +21,7 @@ use sui_indexer_alt_framework::IndexerArgs;
 use sui_indexer_alt_framework::ingestion::ClientArgs;
 use sui_indexer_alt_framework::pipeline::CommitterConfig;
 use sui_indexer_alt_framework::pipeline::concurrent::ConcurrentConfig;
+use sui_indexer_alt_framework::pipeline::sequential::SequentialConfig;
 
 use crate::rate_limiter::CompositeRateLimiter;
 use crate::rate_limiter::RateLimiter;
@@ -327,16 +328,6 @@ impl BigTableIndexer {
         chain: Chain,
         registry: &Registry,
     ) -> Result<Self> {
-        // Register bitmap-index pipelines before the indexer consumes the
-        // store. `set_committer_watermark` and `merge_bitmap` both look up
-        // registered buffers by pipeline name.
-        store
-            .register_bitmap_pipeline::<TransactionBitmapProcessor>()
-            .await?;
-        store
-            .register_bitmap_pipeline::<EventBitmapProcessor>()
-            .await?;
-
         let mut indexer = Indexer::new(
             store,
             indexer_args,
@@ -371,14 +362,32 @@ impl BigTableIndexer {
             ..Default::default()
         };
 
+        fn sequential_config(layer: &ConcurrentLayer, base: &ConcurrentConfig) -> SequentialConfig {
+            let committer = if let Some(c) = layer.committer.clone() {
+                c.finish(base.committer.clone())
+            } else {
+                base.committer.clone()
+            };
+            SequentialConfig {
+                committer,
+                checkpoint_lag: 0,
+                fanout: layer.fanout.clone().or_else(|| base.fanout.clone()),
+                min_eager_rows: layer.min_eager_rows.or(base.min_eager_rows),
+                max_batch_checkpoints: None,
+                processor_channel_size: layer
+                    .processor_channel_size
+                    .or(base.processor_channel_size),
+            }
+        }
+
         indexer
-            .concurrent_pipeline(
+            .sequential_pipeline(
                 BitmapIndexHandler::new(
                     TransactionBitmapProcessor,
                     &pipeline.bitmap_index,
                     build_rate_limiter(&pipeline.bitmap_index, base_rps, &global),
                 ),
-                pipeline.bitmap_index.finish(base.clone()),
+                sequential_config(&pipeline.bitmap_index, &base),
             )
             .await?;
         indexer
@@ -502,13 +511,13 @@ impl BigTableIndexer {
             )
             .await?;
         indexer
-            .concurrent_pipeline(
+            .sequential_pipeline(
                 BitmapIndexHandler::new(
                     EventBitmapProcessor,
                     &pipeline.event_bitmap_index,
                     build_rate_limiter(&pipeline.event_bitmap_index, base_rps, &global),
                 ),
-                pipeline.event_bitmap_index.finish(base.clone()),
+                sequential_config(&pipeline.event_bitmap_index, &base),
             )
             .await?;
 

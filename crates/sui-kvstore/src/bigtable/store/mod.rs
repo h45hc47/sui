@@ -3,9 +3,21 @@
 
 //! BigTable Store implementation for sui-indexer-alt-framework.
 //!
-//! This implements the `Store` and `Connection` traits to allow the new framework
-//! to use BigTable for watermark storage. Per-pipeline watermarks are stored in
-//! the `watermark_alt` table.
+//! Implements the `Store`, `ConcurrentStore`, and `SequentialStore` traits.
+//! Per-pipeline watermarks are stored in the `watermark_alt` table.
+//!
+//! ## Sequential transactions
+//!
+//! BigTable has no multi-row transaction, so [`SequentialStore::transaction`]
+//! runs the closure inline and defers the watermark write until the closure
+//! returns successfully. `set_committer_watermark` buffers its write on the
+//! connection; the transaction impl flushes it to BigTable after the handler's
+//! commit.
+//!
+//! This relies on the handler's writes being idempotent on replay — for the
+//! bitmap pipelines that use this, OR-based bitmap writes with monotonic
+//! cumulative state are idempotent under retry and under partial pre-crash
+//! state (straddler-bucket load reconciles it).
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -13,42 +25,46 @@ use std::sync::RwLock;
 use std::time::Duration;
 
 use anyhow::Result;
+use anyhow::bail;
 use async_trait::async_trait;
+use scoped_futures::ScopedBoxFuture;
 use sui_indexer_alt_framework_store_traits::CommitterWatermark;
 use sui_indexer_alt_framework_store_traits::ConcurrentConnection;
+use sui_indexer_alt_framework_store_traits::ConcurrentStore;
 use sui_indexer_alt_framework_store_traits::Connection;
 use sui_indexer_alt_framework_store_traits::InitWatermark;
 use sui_indexer_alt_framework_store_traits::PrunerWatermark;
 use sui_indexer_alt_framework_store_traits::ReaderWatermark;
+use sui_indexer_alt_framework_store_traits::SequentialConnection;
+use sui_indexer_alt_framework_store_traits::SequentialStore;
 use sui_indexer_alt_framework_store_traits::Store;
 
 use crate::Watermark;
 use crate::bigtable::client::BigTableClient;
 
-mod bitmap_buffer;
-
-pub use bitmap_buffer::BatchMessage;
-pub use bitmap_buffer::BitmapBuffer;
-pub use bitmap_buffer::BitmapIndexBatch;
-pub use bitmap_buffer::BitmapIndexProcessor;
-pub use bitmap_buffer::BitmapIndexValue;
-
 /// A Store implementation backed by BigTable.
 #[derive(Clone)]
 pub struct BigTableStore {
     client: BigTableClient,
-    /// Per-pipeline bitmap-index buffers. Populated lazily on the first
-    /// `commit()` for each pipeline via
-    /// [`BigTableConnection::bitmap_buffer`]. `set_committer_watermark`
-    /// looks up the pipeline's buffer (if any) and flushes it to BigTable
-    /// before persisting the new watermark.
-    bitmap_buffers: Arc<RwLock<HashMap<&'static str, Arc<BitmapBuffer>>>>,
+    /// `tx_hi` observed per pipeline at startup (when the framework calls
+    /// `init_watermark`). Handlers that need to reconcile pre-restart state
+    /// (e.g. the bitmap pipelines, to lazy-load straddler-bucket rows) read
+    /// this via [`BigTableConnection::startup_tx_hi`] on first commit.
+    startup_tx_his: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 /// A connection to BigTable for watermark operations and data writes.
+///
+/// While a [`SequentialStore::transaction`] is in flight,
+/// `set_committer_watermark` buffers its write in `pending_watermark` instead
+/// of hitting BigTable; the transaction impl flushes it after the handler's
+/// commit returns successfully.
 pub struct BigTableConnection<'a> {
     client: BigTableClient,
-    bitmap_buffers: Arc<RwLock<HashMap<&'static str, Arc<BitmapBuffer>>>>,
+    startup_tx_his: Arc<RwLock<HashMap<String, u64>>>,
+    pending_watermark: Option<(String, CommitterWatermark)>,
+    /// `true` while running under `SequentialStore::transaction`.
+    in_sequential_transaction: bool,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
@@ -56,36 +72,8 @@ impl BigTableStore {
     pub fn new(client: BigTableClient) -> Self {
         Self {
             client,
-            bitmap_buffers: Arc::new(RwLock::new(HashMap::new())),
+            startup_tx_his: Arc::new(RwLock::new(HashMap::new())),
         }
-    }
-
-    /// Register pipeline `P`'s bitmap buffer. Called once per bitmap-index
-    /// pipeline during indexer wiring (see `crate::lib`). Reads the
-    /// persisted committer watermark to seed the buffer's `startup_tx_hi`
-    /// so the buffer knows which bucket (if any) straddles the watermark
-    /// and needs pre-restart state loaded on its first flush.
-    ///
-    /// Panics if called twice for the same pipeline — each pipeline gets
-    /// exactly one buffer for the lifetime of the process.
-    pub async fn register_bitmap_pipeline<P: BitmapIndexProcessor>(&self) -> Result<()> {
-        let mut client = self.client.clone();
-        let startup_tx_hi = client
-            .get_pipeline_watermark(P::NAME)
-            .await?
-            .map(|w| w.tx_hi)
-            .unwrap_or(0);
-        let mut buffers = self.bitmap_buffers.write().unwrap();
-        assert!(
-            !buffers.contains_key(P::NAME),
-            "bitmap pipeline {} already registered",
-            P::NAME,
-        );
-        buffers.insert(
-            P::NAME,
-            Arc::new(BitmapBuffer::for_processor::<P>(startup_tx_hi)),
-        );
-        Ok(())
     }
 }
 
@@ -95,26 +83,53 @@ impl BigTableConnection<'_> {
         &mut self.client
     }
 
-    /// Hand `msg` off to pipeline `P`'s bitmap buffer via its mpsc
-    /// channel. The flush thread drains the channel and merges into
-    /// canonical state inside
-    /// [`Connection::set_committer_watermark`]. Panics if `P` wasn't
-    /// registered via [`BigTableStore::register_bitmap_pipeline`].
-    pub fn send_bitmap_batch<P: BitmapIndexProcessor>(&self, msg: BatchMessage) {
-        let buffer = self
-            .bitmap_buffers
+    /// Returns the watermark most recently staged by `set_committer_watermark`
+    /// inside the current `SequentialStore::transaction`. Used by sequential
+    /// handlers that need the about-to-be-persisted watermark in `commit()`.
+    pub fn pending_watermark(&self) -> Option<CommitterWatermark> {
+        self.pending_watermark.as_ref().map(|(_, w)| *w)
+    }
+
+    /// `tx_hi` observed for `pipeline` at startup (when the framework
+    /// called `init_watermark`). Returns `0` for a fresh pipeline with no
+    /// prior watermark.
+    pub fn startup_tx_hi(&self, pipeline: &str) -> u64 {
+        self.startup_tx_his
             .read()
             .unwrap()
-            .get(P::NAME)
-            .cloned()
-            .unwrap_or_else(|| panic!("bitmap pipeline {} not registered", P::NAME));
-        buffer.send(msg);
+            .get(pipeline)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
 #[async_trait]
-impl sui_indexer_alt_framework_store_traits::ConcurrentStore for BigTableStore {
+impl ConcurrentStore for BigTableStore {
     type ConcurrentConnection<'c> = BigTableConnection<'c>;
+}
+
+#[async_trait]
+impl SequentialStore for BigTableStore {
+    type SequentialConnection<'c> = BigTableConnection<'c>;
+
+    async fn transaction<'a, R, F>(&self, f: F) -> Result<R>
+    where
+        R: Send + 'a,
+        F: Send + 'a,
+        F: for<'r> FnOnce(&'r mut Self::Connection<'_>) -> ScopedBoxFuture<'a, 'r, Result<R>>,
+    {
+        let mut conn = self.connect().await?;
+        conn.in_sequential_transaction = true;
+        let result = f(&mut conn).await?;
+        // Closure returned `Ok` — now persist the staged watermark. If this
+        // fails, the framework retries the whole closure; the handler's
+        // write-and-merge is idempotent so retries converge.
+        if let Some((pipeline, watermark)) = conn.pending_watermark.take() {
+            let pw: Watermark = watermark.into();
+            conn.client.set_pipeline_watermark(&pipeline, &pw).await?;
+        }
+        Ok(result)
+    }
 }
 
 #[async_trait]
@@ -124,7 +139,9 @@ impl Store for BigTableStore {
     async fn connect<'c>(&'c self) -> Result<Self::Connection<'c>> {
         Ok(BigTableConnection {
             client: self.client.clone(),
-            bitmap_buffers: self.bitmap_buffers.clone(),
+            startup_tx_his: self.startup_tx_his.clone(),
+            pending_watermark: None,
+            in_sequential_transaction: false,
             _marker: std::marker::PhantomData,
         })
     }
@@ -138,6 +155,12 @@ impl Connection for BigTableConnection<'_> {
         _checkpoint_hi_inclusive: Option<u64>,
     ) -> Result<Option<InitWatermark>> {
         let watermark = self.committer_watermark(pipeline_task).await?;
+        // Snapshot tx_hi so handlers can read it later via
+        // `BigTableConnection::startup_tx_hi` without re-hitting BigTable.
+        self.startup_tx_his
+            .write()
+            .unwrap()
+            .insert(pipeline_task.to_string(), watermark.map_or(0, |w| w.tx_hi));
         Ok(watermark.map(|w| InitWatermark {
             checkpoint_hi_inclusive: Some(w.checkpoint_hi_inclusive),
             reader_lo: None,
@@ -169,18 +192,17 @@ impl Connection for BigTableConnection<'_> {
         pipeline_task: &str,
         watermark: CommitterWatermark,
     ) -> Result<bool> {
-        // If a bitmap-index buffer is registered for this pipeline, flush it
-        // before the watermark advances. The framework retries
-        // `set_committer_watermark` on `Err`, so a flush failure is recoverable
-        // — buffer state is unchanged on retry.
-        let buffer = self
-            .bitmap_buffers
-            .read()
-            .unwrap()
-            .get(pipeline_task)
-            .cloned();
-        if let Some(buffer) = buffer {
-            buffer.flush_through(&mut self.client, &watermark).await?;
+        if self.in_sequential_transaction {
+            if let Some((prev, _)) = self.pending_watermark.as_ref()
+                && prev != pipeline_task
+            {
+                bail!(
+                    "set_committer_watermark called for '{pipeline_task}' \
+                    inside a transaction that already staged '{prev}'"
+                );
+            }
+            self.pending_watermark = Some((pipeline_task.to_string(), watermark));
+            return Ok(true);
         }
 
         let pipeline_watermark: Watermark = watermark.into();
@@ -221,6 +243,9 @@ impl ConcurrentConnection for BigTableConnection<'_> {
         Ok(false)
     }
 }
+
+#[async_trait]
+impl SequentialConnection for BigTableConnection<'_> {}
 
 #[cfg(test)]
 mod tests {

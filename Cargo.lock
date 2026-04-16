@@ -15977,6 +15977,7 @@ dependencies = [
  "rand 0.8.5",
  "roaring",
  "rustls",
+ "scoped-futures",
  "serde",
  "sui-default-config",
  "sui-index-dimensions",

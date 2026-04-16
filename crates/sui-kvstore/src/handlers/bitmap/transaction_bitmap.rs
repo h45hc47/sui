@@ -6,10 +6,11 @@
 //! Emits one bit per `(dimension, tx_seq)` pair. Bits within a bucket row
 //! correspond to `tx_sequence_number`s; see [`crate::tables::transaction_bitmap_index`].
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use roaring::RoaringBitmap;
 use sui_index_dimensions::for_each_transaction_dimension;
 use sui_index_dimensions::write_dimension_key;
 use sui_indexer_alt_framework::pipeline::Processor;
@@ -17,8 +18,8 @@ use sui_types::full_checkpoint_content::Checkpoint;
 
 use crate::tables::transaction_bitmap_index;
 
-use crate::bigtable::store::BitmapIndexProcessor;
-use crate::bigtable::store::BitmapIndexValue;
+use crate::handlers::bitmap::BitmapIndexProcessor;
+use crate::handlers::bitmap::BitmapIndexValue;
 
 // Compile-time check that BUCKET_SIZE fits in u32 (required for RoaringBitmap bit positions).
 const _: () = assert!(transaction_bitmap_index::BUCKET_SIZE <= u32::MAX as u64);
@@ -33,21 +34,19 @@ impl Processor for TransactionBitmapProcessor {
 
     async fn process(&self, checkpoint: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
         let cp = checkpoint.summary.data();
-        let checkpoint_seq = cp.sequence_number;
-        let timestamp_ms = cp.timestamp_ms;
+        let max_cp = cp.sequence_number;
+        let max_ts_ms = cp.timestamp_ms;
         // network_total_transactions is the cumulative count *including* this
         // checkpoint's transactions, so tx_lo is the first tx_seq in this checkpoint.
         let tx_lo = cp.network_total_transactions - checkpoint.transactions.len() as u64;
 
-        let mut values = Vec::new();
+        let mut rows: HashMap<Bytes, (u64, RoaringBitmap)> = HashMap::new();
         let mut dimension_key = Vec::new();
         let mut row_key = Vec::new();
-        let mut seen = HashSet::new();
         for (i, tx) in checkpoint.transactions.iter().enumerate() {
             let tx_seq = tx_lo + i as u64;
             let bucket_id = tx_seq / transaction_bitmap_index::BUCKET_SIZE;
             let bit_position = (tx_seq % transaction_bitmap_index::BUCKET_SIZE) as u32;
-            seen.clear();
 
             for_each_transaction_dimension(tx, |dim, value| {
                 write_dimension_key(&mut dimension_key, dim, value);
@@ -57,21 +56,23 @@ impl Processor for TransactionBitmapProcessor {
                     &dimension_key,
                     bucket_id,
                 );
-                let row_key = Bytes::copy_from_slice(&row_key);
-                if !seen.insert(row_key.clone()) {
-                    return;
-                }
-
-                values.push(BitmapIndexValue {
-                    row_key,
-                    bucket_id,
-                    bit_position,
-                    checkpoint_seq,
-                    timestamp_ms,
-                });
+                rows.entry(Bytes::copy_from_slice(&row_key))
+                    .or_insert_with(|| (bucket_id, RoaringBitmap::new()))
+                    .1
+                    .insert(bit_position);
             });
         }
-        Ok(values)
+
+        Ok(rows
+            .into_iter()
+            .map(|(row_key, (bucket_id, bitmap))| BitmapIndexValue {
+                row_key,
+                bucket_id,
+                bitmap,
+                max_cp,
+                max_ts_ms,
+            })
+            .collect())
     }
 }
 

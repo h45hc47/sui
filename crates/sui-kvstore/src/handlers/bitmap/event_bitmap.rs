@@ -8,9 +8,11 @@
 //! rather than `tx_sequence_number`s. Enables `list_events` to resolve matches
 //! directly in event-space with no over-fetch.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use bytes::Bytes;
+use roaring::RoaringBitmap;
 use sui_index_dimensions::for_each_event_dimension;
 use sui_index_dimensions::write_dimension_key;
 use sui_indexer_alt_framework::pipeline::Processor;
@@ -18,8 +20,8 @@ use sui_types::full_checkpoint_content::Checkpoint;
 
 use crate::tables::event_bitmap_index;
 
-use crate::bigtable::store::BitmapIndexProcessor;
-use crate::bigtable::store::BitmapIndexValue;
+use crate::handlers::bitmap::BitmapIndexProcessor;
+use crate::handlers::bitmap::BitmapIndexValue;
 
 // Compile-time check that BUCKET_SIZE fits in u32 (required for RoaringBitmap bit positions).
 const _: () = assert!(event_bitmap_index::BUCKET_SIZE <= u32::MAX as u64);
@@ -34,13 +36,13 @@ impl Processor for EventBitmapProcessor {
 
     async fn process(&self, checkpoint: &Arc<Checkpoint>) -> anyhow::Result<Vec<Self::Value>> {
         let cp = checkpoint.summary.data();
-        let checkpoint_seq = cp.sequence_number;
-        let timestamp_ms = cp.timestamp_ms;
+        let max_cp = cp.sequence_number;
+        let max_ts_ms = cp.timestamp_ms;
         // network_total_transactions is cumulative *including* this checkpoint,
         // so tx_lo is the first tx_seq in this checkpoint.
         let tx_lo = cp.network_total_transactions - checkpoint.transactions.len() as u64;
 
-        let mut values = Vec::new();
+        let mut rows: HashMap<Bytes, (u64, RoaringBitmap)> = HashMap::new();
         let mut dimension_key = Vec::new();
         let mut row_key = Vec::new();
         for (i, tx) in checkpoint.transactions.iter().enumerate() {
@@ -56,16 +58,23 @@ impl Processor for EventBitmapProcessor {
                     &dimension_key,
                     bucket_id,
                 );
-                values.push(BitmapIndexValue {
-                    row_key: Bytes::copy_from_slice(&row_key),
-                    bucket_id,
-                    bit_position,
-                    checkpoint_seq,
-                    timestamp_ms,
-                });
+                rows.entry(Bytes::copy_from_slice(&row_key))
+                    .or_insert_with(|| (bucket_id, RoaringBitmap::new()))
+                    .1
+                    .insert(bit_position);
             });
         }
-        Ok(values)
+
+        Ok(rows
+            .into_iter()
+            .map(|(row_key, (bucket_id, bitmap))| BitmapIndexValue {
+                row_key,
+                bucket_id,
+                bitmap,
+                max_cp,
+                max_ts_ms,
+            })
+            .collect())
     }
 }
 
@@ -84,7 +93,6 @@ impl BitmapIndexProcessor for EventBitmapProcessor {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
     use std::sync::Arc;
 
     use move_core_types::ident_str;
@@ -139,10 +147,17 @@ mod tests {
             .iter()
             .filter(|v| v.row_key.as_ref() == sender_row_key.as_slice())
             .collect();
-        let sender_bits: HashSet<_> = sender_values.iter().map(|v| v.bit_position).collect();
 
-        assert_eq!(values.len(), 12);
-        assert_eq!(sender_values.len(), 2);
-        assert_eq!(sender_bits.len(), 2);
+        assert!(!values.is_empty());
+        assert_eq!(
+            sender_values.len(),
+            1,
+            "processor groups both events' bits for the same sender row into one value"
+        );
+        assert_eq!(
+            sender_values[0].bitmap.len(),
+            2,
+            "two events contribute two distinct event_seq bits"
+        );
     }
 }
