@@ -347,14 +347,14 @@ mod tests {
     use std::time::Duration;
 
     use prometheus::Registry;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockConnection;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockStore;
     use sui_types::digests::CheckpointDigest;
     use tokio::sync::mpsc;
     use tokio::time::timeout;
 
     use crate::FieldCount;
     use crate::metrics::IndexerMetrics;
-    use crate::mocks::store::MockConnection;
-    use crate::mocks::store::MockStore;
     use crate::pipeline::Processor;
     use crate::types::full_checkpoint_content::Checkpoint;
     use crate::types::test_checkpoint_data_builder::TestCheckpointBuilder;

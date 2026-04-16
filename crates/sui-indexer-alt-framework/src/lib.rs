@@ -466,6 +466,7 @@ mod tests {
     use async_trait::async_trait;
     use clap::Parser;
     use sui_indexer_alt_framework_store_traits::PrunerWatermark;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockStore;
     use sui_synthetic_ingestion::synthetic_ingestion;
     use tokio::sync::watch;
 
@@ -474,7 +475,6 @@ mod tests {
     use crate::ingestion::ingestion_client::IngestionClientArgs;
     use crate::ingestion::store_client::ObjectStoreWatermark;
     use crate::ingestion::store_client::WATERMARK_PATH;
-    use crate::mocks::store::MockStore;
     use crate::pipeline::CommitterConfig;
     use crate::pipeline::Processor;
     use crate::pipeline::concurrent::ConcurrentConfig;

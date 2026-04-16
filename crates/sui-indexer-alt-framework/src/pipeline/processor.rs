@@ -224,6 +224,8 @@ mod tests {
 
     use anyhow::ensure;
     use sui_futures::service;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockStore;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockWatermark;
     use sui_types::digests::ChainIdentifier;
     use sui_types::digests::CheckpointDigest;
     use sui_types::test_checkpoint_data_builder::TestCheckpointBuilder;
@@ -231,8 +233,6 @@ mod tests {
     use tokio::time::timeout;
 
     use crate::metrics::IndexerMetrics;
-    use crate::mocks::store::MockStore;
-    use crate::mocks::store::MockWatermark;
 
     use super::*;
 

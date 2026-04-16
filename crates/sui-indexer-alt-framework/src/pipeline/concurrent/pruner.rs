@@ -333,12 +333,14 @@ mod tests {
 
     use async_trait::async_trait;
     use prometheus::Registry;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockConnection;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockStore;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockWatermark;
     use sui_types::full_checkpoint_content::Checkpoint;
     use tokio::time::Duration;
 
     use crate::FieldCount;
     use crate::metrics::IndexerMetrics;
-    use crate::mocks::store::*;
     use crate::pipeline::Processor;
     use crate::pipeline::concurrent::BatchStatus;
 

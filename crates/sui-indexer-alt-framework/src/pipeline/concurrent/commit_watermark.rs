@@ -311,12 +311,13 @@ mod tests {
     use std::time::Duration;
 
     use async_trait::async_trait;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockConnection;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockStore;
     use sui_types::full_checkpoint_content::Checkpoint;
     use tokio::sync::mpsc;
 
     use crate::FieldCount;
     use crate::metrics::IndexerMetrics;
-    use crate::mocks::store::*;
     use crate::pipeline::CommitterConfig;
     use crate::pipeline::Processor;
     use crate::pipeline::WatermarkPart;

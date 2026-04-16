@@ -396,11 +396,11 @@ mod tests {
 
     use async_trait::async_trait;
     use prometheus::Registry;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockConnection;
+    use sui_indexer_alt_framework_store_traits::testing::mock_store::MockStore;
     use sui_types::full_checkpoint_content::Checkpoint;
     use tokio::sync::mpsc;
 
-    use crate::mocks::store::MockConnection;
-    use crate::mocks::store::MockStore;
     use crate::pipeline::CommitterConfig;
     use crate::pipeline::Processor;
 
