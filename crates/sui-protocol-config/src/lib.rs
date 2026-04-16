@@ -4814,6 +4814,8 @@ impl ProtocolConfig {
                     cfg.feature_flags
                         .early_return_receive_object_mismatched_type = true;
 
+                }
+                122 => {
                     // Enable bulletproofs range proofs on devnet
                     cfg.verify_bulletproofs_ristretto255_base_cost = Some(30000);
                     cfg.verify_bulletproofs_ristretto255_cost_per_bit_and_commitment = Some(6500);
@@ -4821,7 +4823,6 @@ impl ProtocolConfig {
                         cfg.feature_flags.enable_verify_bulletproofs_ristretto255 = true;
                     }
                 }
-                122 => {}
                 // Use this template when making changes:
                 //
                 //     // modify an existing constant.
