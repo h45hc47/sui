@@ -211,6 +211,7 @@ impl store::ConcurrentConnection for Connection<'_> {
         Ok(diesel::update(watermarks::table)
             .set(watermarks::pruner_hi.eq(pruner_hi as i64))
             .filter(watermarks::pipeline.eq(pipeline))
+            .filter(watermarks::pruner_hi.lt(pruner_hi as i64))
             .execute(self)
             .await?
             > 0)
@@ -247,5 +248,28 @@ impl store::SequentialStore for Db {
     {
         let mut conn = self.connect().await?;
         AsyncConnection::transaction(&mut conn, |conn| f(conn)).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::Db;
+    use crate::DbArgs;
+    use crate::MIGRATIONS;
+    use crate::temp::TempDb;
+
+    async fn make_store() -> (TempDb, Db) {
+        let temp_db = TempDb::new().unwrap();
+        let db = Db::for_write(temp_db.database().url().clone(), DbArgs::default())
+            .await
+            .unwrap();
+        db.run_migrations(Some(&MIGRATIONS)).await.unwrap();
+        (temp_db, db)
+    }
+
+    sui_indexer_alt_framework_store_traits::store_tests! {
+        setup: make_store,
+        concurrent,
+        sequential,
     }
 }
