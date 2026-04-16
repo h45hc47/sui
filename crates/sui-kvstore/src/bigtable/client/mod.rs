@@ -817,7 +817,7 @@ impl BigTableClient {
         limit: i64,
         reversed: bool,
         filter: Option<RowFilter>,
-    ) -> Result<impl futures::Stream<Item = Result<(Bytes, Vec<(Bytes, Bytes)>)>>> {
+    ) -> Result<impl futures::Stream<Item = Result<(Bytes, Vec<(Bytes, Bytes)>)>> + use<>> {
         let range = RowRange {
             start_key: start_key.map(StartKey::StartKeyClosed),
             end_key: end_key.map(EndKey::EndKeyClosed),
@@ -873,12 +873,7 @@ impl BigTableClient {
         let mut by_seq: std::collections::HashMap<u64, (TransactionDigest, u64, u32)> =
             std::collections::HashMap::with_capacity(rows.len());
         for (row_key, cells) in &rows {
-            let tx_seq = u64::from_be_bytes(
-                row_key
-                    .as_ref()
-                    .try_into()
-                    .context("tx_seq_digest key not 8 bytes")?,
-            );
+            let tx_seq = tx_seq_digest::decode_key(row_key.as_ref())?;
             let (digest, cp_seq, event_count) = tx_seq_digest::decode(cells)?;
             by_seq.insert(tx_seq, (digest, cp_seq, event_count));
         }
@@ -914,12 +909,7 @@ impl BigTableClient {
             futures::pin_mut!(rows);
             while let Some(row) = rows.next().await {
                 let (row_key, cells) = row?;
-                let tx_seq = u64::from_be_bytes(
-                    row_key
-                        .as_ref()
-                        .try_into()
-                        .context("tx_seq_digest key not 8 bytes")?,
-                );
+                let tx_seq = tx_seq_digest::decode_key(row_key.as_ref())?;
                 let (digest, cp_seq, event_count) = tx_seq_digest::decode(&cells)?;
                 yield (tx_seq, digest, cp_seq, event_count);
             }
@@ -981,43 +971,85 @@ impl BigTableClient {
     }
 
     /// Range-scan `tx_seq_digest` across `tx_range` (half-open) and yield
-    /// each row's `(tx_seq, digest, cp_seq, event_count)` as it arrives.
-    /// Dropping the returned stream cancels the scan — callers can cut it
-    /// off as soon as they've seen enough without paying for the rest.
+    /// each row's `(tx_seq, digest, cp_seq, event_count)` in strictly
+    /// ascending tx_seq order.
+    ///
+    /// Because the row key is salt-prefixed (see
+    /// `tables::tx_seq_digest::encode_key`), a single range scan would only
+    /// cover one of the `SALT_COUNT` shards. We fan out one `range_scan_stream`
+    /// per salt bucket, interleave arrivals with `select_all`, and yield as
+    /// soon as the expected next tx_seq is available. This relies on the
+    /// density invariant that every tx_seq in range has exactly one row
+    /// (the indexer writes for every tx in every checkpoint), so the next
+    /// row to yield is always `prev + 1`. Rows from fast shards buffer in a
+    /// min-heap while we wait for the slow shard that owns the current
+    /// expected tx_seq. Dropping the returned stream cancels all underlying
+    /// scans.
     pub async fn scan_tx_seq_digest_stream(
         &mut self,
         tx_range: Range<u64>,
     ) -> Result<impl futures::Stream<Item = Result<(u64, TransactionDigest, u64, u32)>>> {
         use crate::tables::tx_seq_digest;
+        use std::cmp::Reverse;
+        use std::collections::BinaryHeap;
 
-        // range_scan_stream uses EndKeyClosed, so shift the exclusive end of
-        // tx_range down by 1 to get the correct inclusive upper bound.
-        let start_key = Bytes::from(tx_seq_digest::encode_key(tx_range.start));
-        let end_key = Bytes::from(tx_seq_digest::encode_key(tx_range.end - 1));
-        let rows = self
-            .range_scan_stream(
-                tx_seq_digest::NAME,
-                Some(start_key),
-                Some(end_key),
-                // i64::MAX — stream stops when caller drops or range ends.
-                i64::MAX,
-                false,
-                None,
-            )
-            .await?;
+        // range_scan_stream uses EndKeyClosed, so use an inclusive upper bound
+        // by shifting the exclusive `tx_range.end` down by 1. Within a bucket,
+        // keys stay ordered by tx_seq; only keys written satisfy
+        // `salt == tx_seq % SALT_COUNT`, so each shard's range yields exactly
+        // the rows for its salt in ascending tx_seq order.
+        let inclusive_end = tx_range.end - 1;
+        let mut streams = Vec::with_capacity(tx_seq_digest::SALT_COUNT as usize);
+        for salt in 0..tx_seq_digest::SALT_COUNT {
+            let mut start = Vec::with_capacity(9);
+            start.push(salt as u8);
+            start.extend_from_slice(&tx_range.start.to_be_bytes());
+            let mut end = Vec::with_capacity(9);
+            end.push(salt as u8);
+            end.extend_from_slice(&inclusive_end.to_be_bytes());
+
+            let s = self
+                .range_scan_stream(
+                    tx_seq_digest::NAME,
+                    Some(Bytes::from(start)),
+                    Some(Bytes::from(end)),
+                    // i64::MAX — stream stops when caller drops or range ends.
+                    i64::MAX,
+                    false,
+                    None,
+                )
+                .await?;
+            streams.push(Box::pin(s));
+        }
+        let merged = futures::stream::select_all(streams);
+        let start = tx_range.start;
 
         Ok(async_stream::try_stream! {
             use futures::StreamExt;
-            futures::pin_mut!(rows);
-            while let Some(row) = rows.next().await {
+
+            let mut heap: BinaryHeap<Reverse<(u64, TransactionDigest, u64, u32)>> =
+                BinaryHeap::new();
+            let mut next_expected = start;
+
+            futures::pin_mut!(merged);
+            while let Some(row) = merged.next().await {
                 let (key, cells) = row?;
-                let tx_seq = u64::from_be_bytes(
-                    key.as_ref()
-                        .try_into()
-                        .context("tx_seq_digest key not 8 bytes")?,
-                );
+                let tx_seq = tx_seq_digest::decode_key(key.as_ref())?;
                 let (digest, cp_seq, event_count) = tx_seq_digest::decode(&cells)?;
-                yield (tx_seq, digest, cp_seq, event_count);
+                heap.push(Reverse((tx_seq, digest, cp_seq, event_count)));
+
+                while heap.peek().is_some_and(|Reverse((ts, ..))| *ts == next_expected) {
+                    let Reverse((ts, d, cp, ec)) = heap.pop().unwrap();
+                    yield (ts, d, cp, ec);
+                    next_expected += 1;
+                }
+            }
+
+            // Tail drain: if the table has any hole in the range (shouldn't
+            // happen under the density invariant, but don't stall forever if
+            // it does), flush whatever's left in ascending order.
+            while let Some(Reverse((ts, d, cp, ec))) = heap.pop() {
+                yield (ts, d, cp, ec);
             }
         })
     }
