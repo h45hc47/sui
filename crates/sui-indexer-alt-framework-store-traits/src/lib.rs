@@ -8,6 +8,9 @@ use chrono::DateTime;
 use chrono::Utc;
 use scoped_futures::ScopedBoxFuture;
 
+#[cfg(any(test, feature = "testing"))]
+pub mod testing;
+
 /// Represents a database connection that can be used by the indexer framework to manage watermark
 /// operations, agnostic of the underlying store implementation.
 #[async_trait]
