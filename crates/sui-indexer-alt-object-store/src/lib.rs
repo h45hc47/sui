@@ -164,6 +164,11 @@ impl Connection for ObjectStoreConnection {
     ) -> anyhow::Result<Option<InitWatermark>> {
         let object_path = watermark_path(pipeline_task);
         let reader_lo = checkpoint_hi_inclusive.map_or(0, |cp| cp + 1);
+        // Match the postgres impl (and the `set_reader_watermark` contract): anchor
+        // `pruner_timestamp_ms` at wall-clock time on first write, so the pruner's
+        // `(pruner_timestamp + delay) - now` computation is meaningful before any reader-lo
+        // advancement has happened.
+        let pruner_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let watermark = ObjectStoreWatermark {
             epoch_hi_inclusive: 0,
             checkpoint_hi_inclusive,
@@ -171,7 +176,7 @@ impl Connection for ObjectStoreConnection {
             timestamp_ms_hi_inclusive: 0,
             reader_lo,
             pruner_hi: reader_lo,
-            pruner_timestamp_ms: 0,
+            pruner_timestamp_ms,
         };
         let json_bytes = serde_json::to_vec(&watermark)?;
         let payload: PutPayload = Bytes::from(json_bytes).into();
@@ -322,8 +327,14 @@ impl ConcurrentConnection for ObjectStoreConnection {
     ) -> anyhow::Result<bool> {
         let (current_watermark, e_tag, version) = self.get_watermark_for_write(pipeline).await?;
 
+        if reader_lo <= current_watermark.reader_lo {
+            return Ok(false);
+        }
+
+        let pruner_timestamp_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as u64;
         let new_watermark = ObjectStoreWatermark {
             reader_lo,
+            pruner_timestamp_ms,
             ..current_watermark
         };
         self.set_watermark(pipeline, new_watermark, e_tag, version)
@@ -337,6 +348,10 @@ impl ConcurrentConnection for ObjectStoreConnection {
         pruner_hi: u64,
     ) -> anyhow::Result<bool> {
         let (current_watermark, e_tag, version) = self.get_watermark_for_write(pipeline).await?;
+
+        if pruner_hi <= current_watermark.pruner_hi {
+            return Ok(false);
+        }
 
         let new_watermark = ObjectStoreWatermark {
             pruner_hi,
@@ -400,10 +415,6 @@ mod tests {
 
     const PIPELINE: &str = "pipeline";
 
-    /// One hour in milliseconds. Used in pruner watermark tests as both the expected
-    /// `wait_for_ms` value and the offset for `delay_for_one_hour_wait`.
-    const ONE_HOUR_MS: u64 = 3_600_000;
-
     // Canonical "non-default" watermark field values reused across tests so each one
     // doesn't need to invent its own. Distinct values let assertions catch field mix-ups.
     const EPOCH_HI: u64 = 7;
@@ -414,9 +425,17 @@ mod tests {
     const PRUNER_HI: u64 = 77;
     const PRUNER_TIMESTAMP_MS: u64 = 555;
 
+    async fn make_store() -> ((), ObjectStore) {
+        ((), ObjectStore::new(Arc::new(InMemory::new())))
+    }
+
     async fn store_conn() -> ObjectStoreConnection {
-        let store = ObjectStore::new(Arc::new(InMemory::new()));
-        store.connect().await.unwrap()
+        make_store().await.1.connect().await.unwrap()
+    }
+
+    sui_indexer_alt_framework_store_traits::store_tests! {
+        setup: make_store,
+        concurrent,
     }
 
     async fn read_stored_chain_id(conn: &ObjectStoreConnection, pipeline_task: &str) -> Vec<u8> {
@@ -431,107 +450,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_watermark_operations() {
+    async fn test_init_watermark_fresh_without_checkpoint_reader_lo() {
         let mut conn = store_conn().await;
-
-        // Initially, watermark should not exist
-        let watermark = conn.committer_watermark(PIPELINE).await.unwrap();
-        assert!(watermark.is_none());
-
-        // Bootstrap the underlying watermark file so set_committer_watermark has state to update.
-        conn.init_watermark(PIPELINE, None).await.unwrap();
-
-        // Set initial watermark — derive distinct values from the canonical constants so
-        // they're clearly lower than the updated values used below.
-        let initial_watermark = CommitterWatermark {
-            epoch_hi_inclusive: EPOCH_HI / 2,
-            checkpoint_hi_inclusive: CHECKPOINT_HI / 2,
-            tx_hi: TX_HI / 2,
-            timestamp_ms_hi_inclusive: TIMESTAMP_MS_HI / 2,
-        };
-        let result = conn
-            .set_committer_watermark(PIPELINE, initial_watermark)
-            .await
-            .unwrap();
-        assert!(result, "First watermark update should succeed");
-
-        // Get the watermark and verify it matches
-        let watermark = conn.committer_watermark(PIPELINE).await.unwrap();
-        assert!(watermark.is_some());
-        let watermark = watermark.unwrap();
-        assert_eq!(watermark.epoch_hi_inclusive, EPOCH_HI / 2);
-        assert_eq!(watermark.checkpoint_hi_inclusive, CHECKPOINT_HI / 2);
-        assert_eq!(watermark.tx_hi, TX_HI / 2);
-        assert_eq!(watermark.timestamp_ms_hi_inclusive, TIMESTAMP_MS_HI / 2);
-
-        // Update watermark with higher checkpoint
-        let updated_watermark = CommitterWatermark {
-            epoch_hi_inclusive: EPOCH_HI,
-            checkpoint_hi_inclusive: CHECKPOINT_HI,
-            tx_hi: TX_HI,
-            timestamp_ms_hi_inclusive: TIMESTAMP_MS_HI,
-        };
-        let result = conn
-            .set_committer_watermark(PIPELINE, updated_watermark)
-            .await
-            .unwrap();
-        assert!(
-            result,
-            "Watermark update with higher checkpoint should succeed"
-        );
-
-        // Verify the updated watermark
-        let watermark = conn.committer_watermark(PIPELINE).await.unwrap().unwrap();
-        assert_eq!(watermark.checkpoint_hi_inclusive, CHECKPOINT_HI);
-
-        // Try to set a watermark with a lower checkpoint (should be rejected). Pick a
-        // checkpoint strictly between the initial and updated values.
-        let regressed_watermark = CommitterWatermark {
-            epoch_hi_inclusive: EPOCH_HI / 2,
-            checkpoint_hi_inclusive: (CHECKPOINT_HI / 2) + 1,
-            tx_hi: TX_HI / 2,
-            timestamp_ms_hi_inclusive: TIMESTAMP_MS_HI / 2,
-        };
-        let result = conn
-            .set_committer_watermark(PIPELINE, regressed_watermark)
-            .await
-            .unwrap();
-        assert!(!result, "Watermark regression should be rejected");
-
-        // Verify watermark hasn't changed
-        let watermark = conn.committer_watermark(PIPELINE).await.unwrap().unwrap();
-        assert_eq!(watermark.checkpoint_hi_inclusive, CHECKPOINT_HI);
+        let watermark = conn.init_watermark(PIPELINE, None).await.unwrap().unwrap();
+        assert_eq!(watermark.reader_lo, Some(0));
     }
 
-    /// Bootstrap a pipeline so its watermark satisfies `reader_lo <= checkpoint`, which
-    /// is required for the read-side methods to return `Some`. `init_watermark` alone
-    /// produces `reader_lo = checkpoint + 1`, so we follow it with a committer update.
-    async fn bootstrap(conn: &mut ObjectStoreConnection, checkpoint_hi_inclusive: u64) {
-        conn.init_watermark(PIPELINE, None).await.unwrap();
-        conn.set_committer_watermark(
-            PIPELINE,
-            CommitterWatermark {
-                epoch_hi_inclusive: 0,
-                checkpoint_hi_inclusive,
-                tx_hi: 0,
-                timestamp_ms_hi_inclusive: 0,
-            },
-        )
-        .await
-        .unwrap();
-    }
-
-    /// Build a delay such that `pruner_watermark` returns `wait_for_ms ≈ 1h` for a
-    /// watermark with `pruner_timestamp_ms = 0` (which is what `bootstrap` produces).
-    /// `pruner_watermark` computes `(pruner_timestamp + delay) - now` saturating to 0,
-    /// so the delay must put `pruner_timestamp + delay` past `now` for the wait to be
-    /// non-zero — i.e. delay must be at least `now`.
-    fn delay_for_one_hour_wait() -> Duration {
-        let now_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
+    #[tokio::test]
+    async fn test_init_watermark_fresh_with_checkpoint_reader_lo() {
+        let mut conn = store_conn().await;
+        let watermark = conn
+            .init_watermark(PIPELINE, Some(CHECKPOINT_HI))
+            .await
             .unwrap()
-            .as_millis() as u64;
-        Duration::from_millis(now_ms + ONE_HOUR_MS)
+            .unwrap();
+        assert_eq!(watermark.reader_lo, Some(CHECKPOINT_HI + 1));
+    }
+
+    #[tokio::test]
+    async fn test_init_watermark_returns_existing_reader_lo() {
+        // Object-store preserves the existing reader_lo across `init_watermark` conflict. The
+        // shared macro test can't assert this because bigtable has no reader_lo concept.
+        // Init starts with reader_lo = 0, then set_reader_watermark advances it to READER_LO.
+        let mut conn = store_conn().await;
+        conn.init_watermark(PIPELINE, None).await.unwrap();
+        conn.set_reader_watermark(PIPELINE, READER_LO)
+            .await
+            .unwrap();
+
+        let watermark = conn
+            .init_watermark(PIPELINE, Some(0))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(watermark.reader_lo, Some(READER_LO));
     }
 
     /// Write raw JSON bytes directly to the underlying object store, bypassing the public
@@ -636,11 +588,19 @@ mod tests {
         let init_cp = 50;
         let migrated_reader_lo = init_cp + 1;
 
+        let before_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         let watermark = conn
             .init_watermark(PIPELINE, Some(init_cp))
             .await
             .unwrap()
             .unwrap();
+        let after_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
         // Returned values reflect the legacy file as it was on disk pre-migration.
         assert_eq!(watermark.checkpoint_hi_inclusive, Some(CHECKPOINT_HI));
         assert_eq!(watermark.reader_lo, None);
@@ -660,7 +620,12 @@ mod tests {
         );
         assert_eq!(migrated_watermark.reader_lo, migrated_reader_lo);
         assert_eq!(migrated_watermark.pruner_hi, migrated_reader_lo);
-        assert_eq!(migrated_watermark.pruner_timestamp_ms, 0);
+        // Migrated watermark anchors pruner_timestamp_ms at the time init_watermark ran.
+        assert!(
+            (before_ms..=after_ms).contains(&migrated_watermark.pruner_timestamp_ms),
+            "pruner_timestamp_ms = {}, expected in [{before_ms}, {after_ms}]",
+            migrated_watermark.pruner_timestamp_ms,
+        );
     }
 
     #[tokio::test]
@@ -698,122 +663,6 @@ mod tests {
         assert_eq!(stored_watermark.pruner_timestamp_ms, PRUNER_TIMESTAMP_MS);
     }
 
-    #[tokio::test]
-    async fn test_init_watermark_fresh_with_checkpoint() {
-        let mut conn = store_conn().await;
-
-        let watermark = conn
-            .init_watermark(PIPELINE, Some(CHECKPOINT_HI))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(watermark.checkpoint_hi_inclusive, Some(CHECKPOINT_HI));
-        assert_eq!(watermark.reader_lo, Some(CHECKPOINT_HI + 1));
-    }
-
-    #[tokio::test]
-    async fn test_init_watermark_fresh_without_checkpoint() {
-        let mut conn = store_conn().await;
-
-        let watermark = conn.init_watermark(PIPELINE, None).await.unwrap().unwrap();
-        assert_eq!(watermark.checkpoint_hi_inclusive, None);
-        assert_eq!(watermark.reader_lo, Some(0));
-    }
-
-    #[tokio::test]
-    async fn test_init_watermark_returns_existing_on_conflict() {
-        let mut conn = store_conn().await;
-
-        // First init creates a watermark and advances reader state via set_reader_watermark.
-        conn.init_watermark(PIPELINE, Some(CHECKPOINT_HI))
-            .await
-            .unwrap();
-        conn.set_reader_watermark(PIPELINE, READER_LO)
-            .await
-            .unwrap();
-
-        // Second init must observe AlreadyExists and return the existing values.
-        let watermark = conn
-            .init_watermark(PIPELINE, Some(0))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(watermark.checkpoint_hi_inclusive, Some(CHECKPOINT_HI));
-        assert_eq!(watermark.reader_lo, Some(READER_LO));
-    }
-
-    #[tokio::test]
-    async fn test_reader_watermark_roundtrip() {
-        let mut conn = store_conn().await;
-        bootstrap(&mut conn, CHECKPOINT_HI).await;
-
-        let watermark = conn.reader_watermark(PIPELINE).await.unwrap().unwrap();
-        assert_eq!(watermark.checkpoint_hi_inclusive, CHECKPOINT_HI);
-        assert_eq!(watermark.reader_lo, 0);
-
-        assert!(
-            conn.set_reader_watermark(PIPELINE, READER_LO)
-                .await
-                .unwrap()
-        );
-        let watermark = conn.reader_watermark(PIPELINE).await.unwrap().unwrap();
-        assert_eq!(watermark.reader_lo, READER_LO);
-    }
-
-    #[tokio::test]
-    async fn test_pruner_watermark_wait_for_ms() {
-        let mut conn = store_conn().await;
-        bootstrap(&mut conn, CHECKPOINT_HI).await;
-
-        let watermark = conn
-            .pruner_watermark(PIPELINE, delay_for_one_hour_wait())
-            .await
-            .unwrap()
-            .unwrap();
-        // Allow generous slack for slow CI.
-        assert!(
-            watermark.wait_for_ms > (ONE_HOUR_MS as i64 - 100_000)
-                && watermark.wait_for_ms <= ONE_HOUR_MS as i64,
-            "wait_for_ms = {}",
-            watermark.wait_for_ms
-        );
-    }
-
-    #[tokio::test]
-    async fn test_set_pruner_watermark() {
-        let mut conn = store_conn().await;
-        bootstrap(&mut conn, CHECKPOINT_HI).await;
-
-        assert!(
-            conn.set_pruner_watermark(PIPELINE, PRUNER_HI)
-                .await
-                .unwrap()
-        );
-
-        let watermark = conn
-            .pruner_watermark(PIPELINE, delay_for_one_hour_wait())
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(watermark.pruner_hi, PRUNER_HI);
-    }
-
-    /// `bootstrap` writes `pruner_timestamp_ms = 0`, so with `delay = 0` the inner
-    /// subtraction `0 - now_ms` would underflow if it weren't using `saturating_sub`.
-    /// The expected output is `wait_for_ms == 0`, not a panic and not a negative value.
-    #[tokio::test]
-    async fn test_pruner_watermark_saturates_when_ready() {
-        let mut conn = store_conn().await;
-        bootstrap(&mut conn, CHECKPOINT_HI).await;
-
-        let watermark = conn
-            .pruner_watermark(PIPELINE, Duration::ZERO)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(watermark.wait_for_ms, 0);
-    }
-
     /// With `pruner_timestamp_ms = u64::MAX`, the saturating subtraction leaves a value
     /// well above `i64::MAX`, so the final `i64::try_from` must surface an error rather
     /// than silently wrapping or panicking.
@@ -847,16 +696,6 @@ mod tests {
         let chain_id = [1u8; 32];
         assert!(conn.accepts_chain_id(PIPELINE, chain_id).await.unwrap());
         assert_eq!(read_stored_chain_id(&conn, PIPELINE).await, chain_id);
-    }
-
-    #[tokio::test]
-    async fn test_accepts_chain_id_matching_accepts() {
-        let mut conn = store_conn().await;
-
-        let chain_id = [1u8; 32];
-        assert!(conn.accepts_chain_id(PIPELINE, chain_id).await.unwrap());
-        // Second call with the same chain_id should also accept
-        assert!(conn.accepts_chain_id(PIPELINE, chain_id).await.unwrap());
     }
 
     #[tokio::test]
