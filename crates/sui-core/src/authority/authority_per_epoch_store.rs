@@ -1488,10 +1488,24 @@ impl AuthorityPerEpochStore {
         assert_eq!(self.epoch() + 1, new_committee.epoch);
         self.record_reconfig_halt_duration_metric();
         self.record_epoch_total_duration_metric();
+        let is_validator = new_committee.authority_exists(&name);
+
+        // Figure out the node role for the new epoch by giving priority to validator role.
+        // If the node is not a validator, then check the current node role and return the closest match.
+        let node_role = if is_validator {
+            NodeRole::Validator
+        } else {
+            match self.node_role {
+                NodeRole::Validator | NodeRole::FullNode => NodeRole::FullNode,
+                // We assign the Observer role only when we are certain that this node has acted as an Observer before.
+                // TODO: to be more accurate we actually the need the node's configuration to determine the role.
+                NodeRole::Observer => NodeRole::Observer,
+            }
+        };
         Self::new(
             name,
             Arc::new(new_committee),
-            self.node_role,
+            node_role,
             &self.parent_path,
             self.db_options.clone(),
             self.metrics.clone(),
