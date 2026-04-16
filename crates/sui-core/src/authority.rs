@@ -1008,6 +1008,7 @@ impl AuthorityState {
         tx_signatures: &[GenericSignature],
         input_object_kinds: &[InputObjectKind],
         receiving_objects_refs: &[ObjectRef],
+        protocol_config: &ProtocolConfig,
     ) -> SuiResult<BTreeMap<AccumulatorObjId, (u64, TypeTag)>> {
         // Note: the deny checks may do redundant package loads but:
         // - they only load packages when there is an active package deny map
@@ -1030,6 +1031,14 @@ impl AuthorityState {
             .account_funds_read
             .check_amounts_available(&declared_withdrawals)?;
 
+        if protocol_config.gasless_verify_remaining_balance() && tx_data.is_gasless_transaction() {
+            let min_amounts =
+                sui_types::transaction::get_gasless_allowed_token_types(protocol_config);
+            self.execution_cache_trait_pointers
+                .account_funds_read
+                .check_remaining_amounts_after_withdrawal(&declared_withdrawals, &min_amounts)?;
+        }
+
         Ok(declared_withdrawals)
     }
 
@@ -1049,6 +1058,7 @@ impl AuthorityState {
             transaction.tx_signatures(),
             &input_object_kinds,
             &receiving_objects_refs,
+            epoch_store.protocol_config(),
         )?;
 
         let (input_objects, receiving_objects) = self.input_loader.read_objects_for_signing(
@@ -2571,6 +2581,7 @@ impl AuthorityState {
             &[],
             &input_object_kinds,
             &receiving_object_refs,
+            epoch_store.protocol_config(),
         )?;
         let address_funds: BTreeSet<_> = declared_withdrawals.keys().cloned().collect();
 
