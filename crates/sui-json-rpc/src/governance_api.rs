@@ -137,7 +137,7 @@ impl GovernanceReadApi {
         let system_state_summary: SuiSystemStateSummary =
             system_state.clone().into_sui_system_state_summary();
 
-        let rates = exchange_rates(&self.state, system_state_summary.epoch)
+        let rates = exchange_rates(&self.state, system_state_summary.clone(), system_state_summary.epoch)
             .await?
             .into_iter()
             .map(|rates| (rates.pool_id, rates))
@@ -357,11 +357,9 @@ fn calculate_apy((rate_e, rate_e_1): (PoolTokenExchangeRate, PoolTokenExchangeRa
 )]
 async fn exchange_rates(
     state: &Arc<dyn StateRead>,
+    system_state_summary: SuiSystemStateSummary,
     _current_epoch: EpochId,
 ) -> RpcInterimResult<Vec<ValidatorExchangeRates>> {
-    let system_state = state.get_system_state()?;
-    let system_state_summary: SuiSystemStateSummary = system_state.into_sui_system_state_summary();
-
     // Get validator rate tables
     let mut tables = vec![];
 
